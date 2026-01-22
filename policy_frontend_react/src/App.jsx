@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import Card from './components/Card.jsx'
 import { createJob, getJob, listPolicyFiles, uploadPolicyFiles } from './api.js'
 
@@ -10,7 +12,7 @@ function toItems(text, maxItems = 6) {
     parts = s.split(/[。；;]\s*/).map((x) => x.trim()).filter(Boolean)
   }
   parts = parts.map((x) => x.replace(/^[-•*\s]+/, '').trim()).filter(Boolean)
-  return parts.slice(0, maxItems)
+  return parts
 }
 
 function oneLiner(text, maxLen = 120) {
@@ -34,6 +36,12 @@ function extractDates(text) {
     }
   }
   return out
+}
+
+function Markdown({ children }) {
+  const content = (children || '').toString()
+  if (!content.trim()) return null
+  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
 }
 
 export default function App() {
@@ -82,8 +90,8 @@ export default function App() {
       try {
         const data = await getJob(jobId)
         setJobStatus(data.status)
+        setResult(data.result || null)
         if (data.status === 'succeeded') {
-          setResult(data.result)
           setBusy(false)
           clearInterval(pollTimer.current)
           pollTimer.current = null
@@ -188,10 +196,21 @@ export default function App() {
   const summary = useMemo(() => {
     if (!result) return { conclusion: '', bullets: [], dates: [] }
 
-    const conclusion = oneLiner(result?.what?.answer || '')
-    const bulletText = `${result?.threshold?.answer || ''}\n${result?.compliance?.answer || ''}`
-    const bullets = toItems(bulletText, 5)
-    const dates = extractDates(result?.when?.answer || '')
+    const hasSummary = !!result.summary
+    const hasWhat = !!result.what
+    const hasThreshold = !!result.threshold
+    const hasCompliance = !!result.compliance
+    const hasWhen = !!result.when
+
+    const conclusion = hasSummary ? oneLiner(result.summary?.answer || '') : ''
+
+    let bullets = []
+    if (hasThreshold && hasCompliance) {
+      const bulletText = `${result.threshold?.answer || ''}\n${result.compliance?.answer || ''}`
+      bullets = toItems(bulletText, 5)
+    }
+
+    const dates = hasWhen ? extractDates(result.when?.answer || '') : []
 
     return { conclusion, bullets, dates }
   }, [result])
@@ -199,22 +218,36 @@ export default function App() {
   const support = useMemo(() => {
     if (!result) return { who: [], ban: [], money: [], materials: [], thresholds: [] }
 
+    const hasWho = !!result.who
+    const hasCompliance = !!result.compliance
+    const hasHowMuch = !!result.how_much
+    const hasWhat = !!result.what
+    const hasHow = !!result.how
+    const hasThreshold = !!result.threshold
+
     return {
-      who: toItems(result?.who?.answer || '', 6),
-      ban: toItems(result?.compliance?.answer || '', 5),
-      money: toItems(`${result?.how_much?.answer || ''}\n${result?.what?.answer || ''}`, 6),
-      materials: toItems(result?.how?.answer || '', 10),
-      thresholds: toItems(result?.threshold?.answer || '', 4)
+      who: hasWho ? toItems(result.who?.answer || '', 6) : [],
+      ban: hasCompliance ? toItems(result.compliance?.answer || '', 5) : [],
+      money:
+        hasHowMuch && hasWhat
+          ? toItems(`${result.how_much?.answer || ''}\n${result.what?.answer || ''}`, 6)
+          : [],
+      materials: hasHow ? toItems(result.how?.answer || '', 10) : [],
+      thresholds: hasThreshold ? toItems(result.threshold?.answer || '', 4) : []
     }
   }, [result])
 
   const impact = useMemo(() => {
     if (!result) return { impactItems: [], actionItems: [], dates: [] }
 
+    const hasWhat = !!result.what
+    const hasActions = !!result.actions
+    const hasWhen = !!result.when
+
     return {
-      impactItems: toItems(result?.what?.answer || '', 3),
-      actionItems: toItems(result?.how?.answer || '', 3),
-      dates: extractDates(result?.when?.answer || '')
+      impactItems: hasWhat ? toItems(result.what?.answer || '', 3) : [],
+      actionItems: hasActions ? toItems(result.actions?.answer || '', 6) : [],
+      dates: hasWhen ? extractDates(result.when?.answer || '') : []
     }
   }, [result])
 
@@ -379,16 +412,12 @@ export default function App() {
       <main className="main">
         <div className="left">
           <Card title="【政策要点总览】" right={<span className="tag">官方来源</span>}>
-            <div className="oneLine">一句话结论：{result ? summary.conclusion : '请先上传政策文件并点击“提取政策信息”'}</div>
-            {result && summary.bullets.length > 0 ? (
-              <ul className="ul">
-                {summary.bullets.map((x, idx) => (
-                  <li key={idx}>{x}</li>
-                ))}
-              </ul>
-            ) : (
-              <div className="muted">暂无要点，提取后将展示关键摘要与注意事项。</div>
-            )}
+            <div className="oneLine">
+              一句话结论：
+              {jobStatus === 'succeeded' && summary.conclusion
+                ? summary.conclusion
+                : '请先上传政策文件并点击“提取政策信息”'}
+            </div>
 
             <div className="kv">
               <span>
@@ -414,7 +443,9 @@ export default function App() {
                 <div className="panelTitle">支持对象</div>
                 <ul className="ul">
                   {(support.who.length ? support.who : ['（提取后展示支持对象）']).map((x, idx) => (
-                    <li key={idx}>✅ {x}</li>
+                    <li key={idx}>
+                       <Markdown>{x}</Markdown>
+                    </li>
                   ))}
                 </ul>
               </div>
@@ -422,7 +453,9 @@ export default function App() {
                 <div className="panelTitle">不适用 / 负面清单</div>
                 <ul className="ul">
                   {(support.ban.length ? support.ban : ['（提取后展示不适用情形）']).map((x, idx) => (
-                    <li key={idx}>❌ {x}</li>
+                    <li key={idx}>
+                       <Markdown>{x}</Markdown>
+                    </li>
                   ))}
                 </ul>
               </div>
@@ -430,33 +463,41 @@ export default function App() {
                 <div className="panelTitle">扶持方式与资金规则</div>
                 <ul className="ul">
                   {(support.money.length ? support.money : ['（提取后展示扶持方式与资金规则）']).map((x, idx) => (
-                    <li key={idx}>• {x}</li>
+                    <li key={idx}>
+                       <Markdown>{x}</Markdown>
+                    </li>
                   ))}
                 </ul>
               </div>
             </div>
 
-            <div className="kv" style={{ marginTop: 12 }}>
-              <span>
-                <b>核心申报条件：</b>
-              </span>
-              {(support.thresholds.length ? support.thresholds : ['（提取后展示）']).map((x, idx) => (
-                <span className="pill" key={idx}>
-                  {x}
-                </span>
-              ))}
-            </div>
-
-            <details className="details">
-              <summary>申报材料清单（点击展开）</summary>
-              <div className="detailsBody">
-                {(support.materials.length ? support.materials : ['提取后将展示申报流程与所需材料。']).map((x, idx) => (
-                  <div key={idx} className="detailLine">
-                    - {x}
+            <div className="grid2" style={{ marginTop: 12 }}>
+              <div className="panel">
+                <details className="details">
+                  <summary className="panelTitle">核心申报条件（点击展开）</summary>
+                  <div className="detailsBody">
+                    {(support.thresholds.length ? support.thresholds : ['提取后将展示核心申报条件。']).map((x, idx) => (
+                      <div key={idx} className="detailLine">
+                        <Markdown>{x}</Markdown>
+                      </div>
+                    ))}
                   </div>
-                ))}
+                </details>
               </div>
-            </details>
+
+              <div className="panel">
+                <details className="details">
+                  <summary className="panelTitle">申报材料清单（点击展开）</summary>
+                  <div className="detailsBody">
+                    {(support.materials.length ? support.materials : ['提取后将展示申报流程与所需材料。']).map((x, idx) => (
+                      <div key={idx} className="detailLine">
+                        <Markdown>{x}</Markdown>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              </div>
+            </div>
           </Card>
 
           <Card title="【影响解读与行动建议】">
@@ -497,7 +538,9 @@ export default function App() {
 
                 <ul className="ul">
                   {(impact.impactItems.length ? impact.impactItems : ['（提取后展示政策影响与适用范围）']).map((x, idx) => (
-                    <li key={idx}>{x}</li>
+                    <li key={idx}>
+                      <Markdown>{x}</Markdown>
+                    </li>
                   ))}
                 </ul>
               </div>
@@ -507,7 +550,9 @@ export default function App() {
                 <div className="muted">基于政策要点与申报规则生成的行动建议（示意）</div>
                 <ul className="ul" style={{ marginTop: 8 }}>
                   {(impact.actionItems.length ? impact.actionItems : ['（提取后展示可执行行动建议）']).map((x, idx) => (
-                    <li key={idx}>{x}</li>
+                    <li key={idx}>
+                      <Markdown>{x}</Markdown>
+                    </li>
                   ))}
                 </ul>
               </div>

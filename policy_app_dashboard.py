@@ -721,9 +721,9 @@ def main() -> None:
         else:
             who_items, ban_items, money_items, material_items, threshold_items = [], [], [], [], []
 
-        who_html = "".join([f"<li>✅ {_escape(x)}</li>" for x in (who_items or ["（提取后展示支持对象）"])])
-        ban_html = "".join([f"<li>❌ {_escape(x)}</li>" for x in (ban_items or ["（提取后展示不适用情形）"])])
-        money_html = "".join([f"<li>• {_escape(x)}</li>" for x in (money_items or ["（提取后展示扶持方式与资金规则）"])])
+        who_html = "".join([f"<li>{_escape(x)}</li>" for x in (who_items or ["（提取后展示支持对象）"])])
+        ban_html = "".join([f"<li>{_escape(x)}</li>" for x in (ban_items or ["（提取后展示不适用情形）"])])
+        money_html = "".join([f"<li>{_escape(x)}</li>" for x in (money_items or ["（提取后展示扶持方式与资金规则）"])])
         threshold_pills = " ".join([f"<span class='pill'>{_escape(x)}</span>" for x in threshold_items])
 
         st.markdown(

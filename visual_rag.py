@@ -668,6 +668,99 @@ class VisualRAGPipeline:
         else:
             raise ValueError(f"Unsupported LLM model: {self.llm_model}")
 
+    def generate_text_only(self, prompt, max_tokens: int = 512) -> str:
+        """Use the underlying LLM in text-only mode.
+
+        This bypasses visual retrieval and is suitable for summarization over
+        existing文本，例如基于七个维度回答再次输出一句话结论。
+        """
+
+        try:
+            if self.llm_model == "doubao":
+                response = self.llm.responses.create(  # type: ignore[attr-defined]
+                    model="doubao-seed-1-6-flash-250828",
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt,
+                                }
+                            ],
+                        }
+                    ],
+                )
+                try:
+                    return response.output[1].content[0].text  # type: ignore[union-attr,index]
+                except Exception:
+                    return ""
+
+            if self.llm_model == "gpt4":
+                response = self.client.chat.completions.create(  # type: ignore[attr-defined]
+                    model="chatgpt-4o-latest",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                )
+                return (response.choices[0].message.content or "").strip()  # type: ignore[union-attr]
+
+            if self.llm_model == "qwen":
+                server_url = getattr(self, "qwen_server_url", None)
+                model_name = getattr(self, "qwen_model_name", None) or "Qwen/Qwen2.5-VL-7B-Instruct"
+
+                if not server_url:
+                    logger.warning("qwen_server_url not configured; cannot call Qwen-VL text-only endpoint")
+                    return ""
+
+                s = server_url.strip()
+                if not (s.startswith("http://") or s.startswith("https://")):
+                    s = "http://" + s
+                base = s.rstrip("/")
+                if not base.endswith("/v1"):
+                    base = f"{base}/v1"
+                url = f"{base}/chat/completions"
+
+                payload = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.3,
+                }
+
+                headers = {"Content-Type": "application/json"}
+
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    data=json.dumps(payload),
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                choices = data.get("choices") or []
+                if not choices:
+                    return ""
+                message = choices[0].get("message", {})
+                content = message.get("content")
+
+                if isinstance(content, str):
+                    generated = content
+                else:
+                    parts = []
+                    for block in content or []:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            parts.append(block.get("text", ""))
+                    generated = "".join(parts)
+
+                return (generated or "").strip()
+
+            raise ValueError(f"Unsupported LLM model for text-only generation: {self.llm_model}")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error in generate_text_only: {str(e)}")
+            return ""
+
     def extract_sections(self, text):
         """Extract markdown sections (Evidence, Chain of Thought, Answer)."""
         sections = {}

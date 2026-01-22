@@ -10,7 +10,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from retrieval_pipe import PolicyRetrievalPipeline
+from retrieval_pipe import POLICY_QUESTIONS, PolicyRetrievalPipeline
 
 
 
@@ -121,17 +121,95 @@ def _build_pipeline(cfg: JobConfig) -> PolicyRetrievalPipeline:
 async def _run_job(job_id: str, inputs: List[str], cfg: JobConfig) -> None:
     JOBS[job_id]["status"] = "running"
     JOBS[job_id]["error"] = None
-    JOBS[job_id]["result"] = None
+    JOBS[job_id]["result"] = {}
+
+    def _work() -> Dict[str, Dict[str, str]]:
+        pipeline = _build_pipeline(cfg)
+
+        pipeline.add_inputs(inputs)
+        pipeline._ensure_visdom()  # type: ignore[attr-defined]
+
+        partial: Dict[str, Dict[str, str]] = {}
+        for key, question in POLICY_QUESTIONS.items():
+            try:
+                response = pipeline._visdom.answer_question(question)  # type: ignore[attr-defined]
+                if response is None:
+                    partial[key] = {"question": question, "answer": "", "analysis": ""}
+                else:
+                    partial[key] = {
+                        "question": question,
+                        "answer": response.get("answer", ""),
+                        "analysis": response.get("analysis", ""),
+                    }
+            except Exception as exc:  # noqa: BLE001
+                partial[key] = {"question": question, "answer": "", "analysis": f"调用出错: {exc}"}
+
+            JOBS[job_id]["result"] = partial.copy()
+
+        # 额外一步：在 7 个维度回答完成后，让模型基于这些回答输出一句话结论
+        dim_summary = (
+            "【申报主体（who）】" + partial.get("who", {}).get("answer", "") + "\n"
+            "【资金用途（what）】" + partial.get("what", {}).get("answer", "") + "\n"
+            "【补贴标准（how_much）】" + partial.get("how_much", {}).get("answer", "") + "\n"
+            "【申报门槛（threshold）】" + partial.get("threshold", {}).get("answer", "") + "\n"
+            "【合规要求（compliance）】" + partial.get("compliance", {}).get("answer", "") + "\n"
+            "【时间节点（when）】" + partial.get("when", {}).get("answer", "") + "\n"
+            "【申报流程与材料（how）】" + partial.get("how", {}).get("answer", "")
+        )
+
+        summary_question = (
+            "下面是你刚才针对同一份政策文本、从七个维度给出的回答，请先通读这些内容：\n"  # noqa: E501
+            f"{dim_summary}\n\n"
+            "请严格基于以上七个维度的回答，总结一句话结论，概括该政策的核心目标、主要支持方向或关键变化。"  # noqa: E501
+            "要求：用中文作答，语言简洁有力，只输出这一句话，不要展开成多段。"
+        )
+        try:
+            vis_pipeline = pipeline._visdom  # type: ignore[attr-defined]
+            summary_text = vis_pipeline.generate_text_only(summary_question)  # type: ignore[attr-defined]
+
+            partial["summary"] = {
+                "question": summary_question,
+                "answer": summary_text,
+                "analysis": "",
+            }
+        except Exception as exc:  # noqa: BLE001
+            partial["summary"] = {
+                "question": summary_question,
+                "answer": "",
+                "analysis": f"调用出错: {exc}",
+            }
+
+        actions_prompt = (
+            "下面是你刚才针对同一份政策文本、从七个维度给出的详细回答：\n"  # noqa: E501
+            f"{dim_summary}\n\n"
+            "请基于这些回答，面向申报主体给出3-6条AI行动建议，概括需要重点关注的注意事项、风险提示以及申报材料准备要点。"
+            "要求：用中文作答，以列表形式输出，每条建议不超过50字。"
+        )
+        try:
+            vis_pipeline = pipeline._visdom  # type: ignore[attr-defined]
+            actions_text = vis_pipeline.generate_text_only(actions_prompt)  # type: ignore[attr-defined]
+
+            partial["actions"] = {
+                "question": actions_prompt,
+                "answer": actions_text,
+                "analysis": "",
+            }
+        except Exception as exc:  # noqa: BLE001
+            partial["actions"] = {
+                "question": actions_prompt,
+                "answer": "",
+                "analysis": f"调用出错: {exc}",
+            }
+
+        JOBS[job_id]["result"] = partial.copy()
+
+        return partial
 
     try:
-        def _work() -> Dict[str, Dict[str, str]]:
-            pipeline = _build_pipeline(cfg)
-            return pipeline.retrieve_policy_info(inputs)
-
         result = await asyncio.to_thread(_work)
         JOBS[job_id]["status"] = "succeeded"
         JOBS[job_id]["result"] = result
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         JOBS[job_id]["status"] = "failed"
         JOBS[job_id]["error"] = str(e)
 

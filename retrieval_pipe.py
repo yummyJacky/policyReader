@@ -25,7 +25,7 @@ class PolicyRetrievalPipeline:
         data_dir: str = "./policy_data",
         output_dir: str = "./policy_outputs",
         llm_model: str = "doubao",
-        vision_retriever: str = "colpali",
+        vision_retriever: str = "nemo",
         api_keys: Optional[Dict[str, str]] = None,
         top_k: int = 5,
         force_reindex: bool = False,
