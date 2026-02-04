@@ -135,6 +135,6 @@ dmypy.json
 
 # DATA
 *outputs/
-
+banana-slides/
 .env
 READDME copy.md

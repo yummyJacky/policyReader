@@ -24,7 +24,7 @@ def main():
     pipeline = PolicyRetrievalPipeline(
         data_dir="./policy_data",          # PDF 统一放在这里
         output_dir="./policy_outputs",     # 检索输出目录
-        llm_model="qwen",                # 或 "gpt4" / "qwen"，与 visual_rag 配置一致
+        llm_model="doubao",                # 或 "gpt4" / "qwen"，与 visual_rag 配置一致
         vision_retriever="nemo",        # 或 "nemo" 等
         api_keys={
             "doubao": ark_api_key,
@@ -48,14 +48,29 @@ def main():
     # 3. 调用 pipeline，得到 7 个维度的结果
     results = pipeline.retrieve_policy_info(inputs)
 
-    # 4. 按 7 个预设维度打印结果
+    # 4. 按 7 个预设维度打印结果，并将所有维度的回答写入同一个文件方便观察 answer 格式
     print("==== 政策关键信息抽取结果 ====")
-    for key in POLICY_QUESTIONS.keys():
-        info = results.get(key, {})
-        print(f"\n[{key}]")
-        print("问题：", info.get("question", ""))
-        print("答案：", info.get("answer", ""))
-        print("分析：", info.get("analysis", ""))
+
+    output_path = os.path.join(pipeline.output_dir, "dim_answers.txt")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("==== 政策关键信息抽取结果 ====\n")
+
+        for key in POLICY_QUESTIONS.keys():
+            info = results.get(key, {})
+
+            question = info.get("question", "")
+            answer = info.get("answer", "")
+            analysis = info.get("analysis", "")
+
+            print(f"\n[{key}]")
+            print("问题：", question)
+            print("答案：", answer)
+            print("分析：", analysis)
+
+            f.write(f"\n[{key}]\n")
+            f.write(f"问题：{question}\n")
+            f.write(f"答案：{answer}\n")
+            f.write(f"分析：{analysis}\n")
 
 
 if __name__ == "__main__":

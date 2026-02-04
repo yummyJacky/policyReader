@@ -10,7 +10,12 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from retrieval_pipe import POLICY_QUESTIONS, PolicyRetrievalPipeline
+from retrieval_pipe import (
+    POLICY_QUESTIONS,
+    PolicyRetrievalPipeline,
+    build_dim_summary_text,
+    generate_one_sentence_summary,
+)
 
 
 
@@ -147,37 +152,19 @@ async def _run_job(job_id: str, inputs: List[str], cfg: JobConfig) -> None:
             JOBS[job_id]["result"] = partial.copy()
 
         # 额外一步：在 7 个维度回答完成后，让模型基于这些回答输出一句话结论
-        dim_summary = (
-            "【申报主体（who）】" + partial.get("who", {}).get("answer", "") + "\n"
-            "【资金用途（what）】" + partial.get("what", {}).get("answer", "") + "\n"
-            "【补贴标准（how_much）】" + partial.get("how_much", {}).get("answer", "") + "\n"
-            "【申报门槛（threshold）】" + partial.get("threshold", {}).get("answer", "") + "\n"
-            "【合规要求（compliance）】" + partial.get("compliance", {}).get("answer", "") + "\n"
-            "【时间节点（when）】" + partial.get("when", {}).get("answer", "") + "\n"
-            "【申报流程与材料（how）】" + partial.get("how", {}).get("answer", "")
-        )
-
-        summary_question = (
-            "下面是你刚才针对同一份政策文本、从七个维度给出的回答，请先通读这些内容：\n"  # noqa: E501
-            f"{dim_summary}\n\n"
-            "请严格基于以上七个维度的回答，总结一句话结论，概括该政策的核心目标、主要支持方向或关键变化。"  # noqa: E501
-            "要求：用中文作答，语言简洁有力，只输出这一句话，不要展开成多段。"
-        )
         try:
             vis_pipeline = pipeline._visdom  # type: ignore[attr-defined]
-            summary_text = vis_pipeline.generate_text_only(summary_question)  # type: ignore[attr-defined]
-
-            partial["summary"] = {
-                "question": summary_question,
-                "answer": summary_text,
-                "analysis": "",
-            }
+            partial["summary"] = generate_one_sentence_summary(vis_pipeline, partial)
         except Exception as exc:  # noqa: BLE001
-            partial["summary"] = {
-                "question": summary_question,
+            # generate_one_sentence_summary 已经会将错误写入 analysis，这里仅兜底
+            partial.setdefault("summary", {
+                "question": "",
                 "answer": "",
                 "analysis": f"调用出错: {exc}",
-            }
+            })
+
+        # 生成 AI 行动建议时复用同一份 dim_summary 汇总文案
+        dim_summary = build_dim_summary_text(partial)
 
         actions_prompt = (
             "下面是你刚才针对同一份政策文本、从七个维度给出的详细回答：\n"  # noqa: E501

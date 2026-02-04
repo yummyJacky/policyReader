@@ -155,7 +155,57 @@ class PolicyRetrievalPipeline:
                 "answer": response.get("answer", ""),
                 "analysis": response.get("analysis", ""),
             }
+
         return results
+    def build_dim_summary_text(self,dim_answers: Dict[str, Dict[str, str]]) -> str:
+        """根据七个维度回答构造用于总结的一段汇总文本。"""
+
+        return (
+            "【申报主体（who）】" + dim_answers.get("who", {}).get("answer", "") + "\n"
+            + "【资金用途（what）】" + dim_answers.get("what", {}).get("answer", "") + "\n"
+            + "【补贴标准（how_much）】" + dim_answers.get("how_much", {}).get("answer", "") + "\n"
+            + "【申报门槛（threshold）】" + dim_answers.get("threshold", {}).get("answer", "") + "\n"
+            + "【合规要求（compliance）】" + dim_answers.get("compliance", {}).get("answer", "") + "\n"
+            + "【时间节点（when）】" + dim_answers.get("when", {}).get("answer", "") + "\n"
+            + "【申报流程与材料（how）】" + dim_answers.get("how", {}).get("answer", "")
+        )
 
 
-__all__ = ["PolicyRetrievalPipeline", "POLICY_QUESTIONS"]
+    def generate_one_sentence_summary(
+        self,
+        dim_answers: Dict[str, Dict[str, str]],
+    ) -> Dict[str, str]:
+        """基于七个维度回答，调用多模态流水线生成一句话总结。"""
+
+        # 确保有可用的 VisualRAGPipeline 实例，即便当前尚未跑过检索流程
+        if self._visdom is None:
+            self._visdom = VisualRAGPipeline(self._config)
+
+        dim_summary = self.build_dim_summary_text(dim_answers)
+
+        summary_question = (
+            "下面是刚才针对同一份政策文本、从七个维度给出的回答，请先通读这些内容：\n"  # noqa: E501
+            f"{dim_summary}\n\n"
+            "请严格基于以上七个维度的回答，总结一句话结论，概括该政策的核心目标、主要支持方向或关键变化。"  # noqa: E501
+            "要求：用中文作答，语言简洁有力，只输出这一句话，不要展开成多段。"
+        )
+
+        try:
+            summary_text = self._visdom.generate_text_only(summary_question)
+            return {
+                "question": summary_question,
+                "answer": summary_text,
+                "analysis": "",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "question": summary_question,
+                "answer": "",
+                "analysis": f"调用出错: {exc}",
+            }
+
+
+__all__ = [
+    "PolicyRetrievalPipeline",
+    "POLICY_QUESTIONS",
+]
