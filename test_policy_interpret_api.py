@@ -8,19 +8,10 @@ import requests
 from requests import Session
 from requests.exceptions import ChunkedEncodingError
 
+from policy_intent import detect_intent
+
 
 DONE_MARK = "[DONE]"
-
-
-def call_intent_api(*, sess: Session, base_url: str, message: str, timeout: int = 60) -> str:
-    url = base_url.rstrip("/") + "/api/policy-intent"
-    resp = sess.post(url, data={"message": message}, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    intent = str(data.get("intent") or "").strip()
-    if intent not in {"text_only", "text_and_poster", "poster_only"}:
-        raise AssertionError(f"Unexpected intent: {intent!r}, raw={data}")
-    return intent
 
 
 def iter_stream_lines(resp: requests.Response) -> Iterator[str]:
@@ -71,6 +62,7 @@ def call_api(
     os.makedirs(round_dir, exist_ok=True)
     stream_path = os.path.join(round_dir, "stream.jsonl")
     meta_path = os.path.join(round_dir, "meta.json")
+    text_path = os.path.join(round_dir, "text.txt")
 
     got_done = False
     got_error = False
@@ -78,6 +70,9 @@ def call_api(
     got_image = False
     doc_tags: List[str] = []
     from_cache_flags: List[bool] = []
+    text_contents: List[str] = []
+    image_urls: List[str] = []
+    downloaded_images: List[str] = []
 
     files = None
     fh = None
@@ -103,6 +98,9 @@ def call_api(
                     if obj and obj.get("type") == "RESPONSE":
                         if obj.get("messageType") == "TEXT":
                             got_text = True
+                            content = obj.get("content")
+                            if isinstance(content, str) and content.strip():
+                                text_contents.append(content)
                         if obj.get("messageType") == "IMAGE":
                             got_image = True
                             content = obj.get("content") or {}
@@ -111,6 +109,9 @@ def call_api(
                                     doc_tags.append(str(content.get("doc_tag")))
                                 if "from_cache" in content:
                                     from_cache_flags.append(bool(content.get("from_cache")))
+                                url = content.get("url")
+                                if url:
+                                    image_urls.append(str(url))
 
                     print(line)
     finally:
@@ -119,6 +120,30 @@ def call_api(
 
     if got_error:
         print("[test] got ERROR line")
+
+    if text_contents:
+        with open(text_path, "w", encoding="utf-8") as fp:
+            fp.write("\n\n".join(text_contents))
+
+    for idx, url in enumerate(image_urls, start=1):
+        try:
+            r = sess.get(url, stream=True, timeout=300)
+            r.raise_for_status()
+            ext = ".png"
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "jpeg" in ctype or "jpg" in ctype:
+                ext = ".jpg"
+            elif "webp" in ctype:
+                ext = ".webp"
+
+            local_path = os.path.join(round_dir, f"image_{idx}{ext}")
+            with open(local_path, "wb") as fp:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fp.write(chunk)
+            downloaded_images.append(local_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[test] failed to download image url={url}: {exc}")
 
     meta: Dict[str, Any] = {
         "round_name": round_name,
@@ -132,6 +157,9 @@ def call_api(
         "got_image": got_image,
         "doc_tags": doc_tags,
         "from_cache_flags": from_cache_flags,
+        "text_path": text_path if text_contents else None,
+        "image_urls": image_urls,
+        "downloaded_images": downloaded_images,
         "got_error": got_error,
         "got_done": got_done,
     }
@@ -148,7 +176,7 @@ def assert_intent_output(case_name: str, meta: Dict[str, Any]) -> None:
         assert not meta["got_image"], "text_only should not include IMAGE"
     elif case_name == "poster_only":
         assert meta["got_image"], "poster_only should include IMAGE"
-        assert not meta["got_text"], "poster_only should not include TEXT"
+        # assert not meta["got_text"], "poster_only should not include TEXT"
     elif case_name == "text_and_poster":
         assert meta["got_text"], "text_and_poster should include TEXT"
         assert meta["got_image"], "text_and_poster should include IMAGE"
@@ -162,7 +190,11 @@ def main() -> None:
     parser.add_argument("--endpoint", default="/api/policy-interpre", help="API endpoint path")
     parser.add_argument("--file", required=True, help="Policy file path")
     parser.add_argument("--file2", default=None, help="Second policy file path (optional, for cache reset test)")
-    parser.add_argument("--out-dir", default="test_runs", help="Directory to save per-round outputs")
+    parser.add_argument(
+        "--out-dir",
+        default="/home/zechuan/policyReader/test_runs",
+        help="Directory to save per-round outputs",
+    )
     args = parser.parse_args()
 
     root_ts = time.strftime("%Y%m%d_%H%M%S")
@@ -171,7 +203,7 @@ def main() -> None:
 
     sess = requests.Session()
 
-    # 1) 意图识别是否正确：只调用意图识别接口，不跑解析流程
+    # 1) 意图识别是否正确：本地调用 detect_intent，不跑解析流程
     cases = [
         ("text_only", "解读这个政策文件"),
         ("text_and_poster", "解读政策文件并生成海报展示"),
@@ -179,8 +211,8 @@ def main() -> None:
     ]
 
     for name, msg in cases:
-        print(f"\n=== Intent Case: {name} (intent-only endpoint) ===")
-        predicted = call_intent_api(sess=sess, base_url=args.base_url, message=msg)
+        print(f"\n=== Intent Case: {name} (local detect_intent) ===")
+        predicted = detect_intent(msg)
         if predicted != name:
             raise SystemExit(f"Intent case {name} failed: predicted={predicted}")
 

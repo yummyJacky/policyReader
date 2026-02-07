@@ -4,9 +4,7 @@ from typing import Literal
 from dotenv import load_dotenv
 from openai import OpenAI
 
-
 load_dotenv()
-
 
 SessionIntent = Literal["text_only", "text_and_poster", "poster_only"]
 
@@ -25,6 +23,10 @@ def _detect_intent_prompt(message: str) -> str:
         "输出：text_and_poster\n\n"
         "用户：只需要海报，不要文字\n"
         "输出：poster_only\n\n"
+        "用户：将解读的内容生成海报展示\n"
+        "输出：poster_only\n\n"
+        "用户：根据解读结果生成海报\n"
+        "输出：poster_only\n\n"
         "用户：门槛指标有哪些？\n"
         "输出：text_only\n\n"
         f"用户：{message}\n"
@@ -36,6 +38,17 @@ def _detect_intent_rule(message: str) -> SessionIntent:
     msg = (message or "").strip().lower()
     if not msg:
         return "text_only"
+
+    # 强规则：只要用户表达“把已有解读/结果做成海报”，则属于 poster_only
+    poster_only_phrases = [
+        "将解读", "把解读", "根据解读", "基于解读", "按解读", "用解读",
+        "将解析", "把解析", "根据解析", "基于解析",
+        "将结果", "把结果", "根据结果", "基于结果",
+        "将内容", "把内容", "根据内容", "基于内容",
+    ]
+    if any(p in msg for p in poster_only_phrases) and ("海报" in msg or "配图" in msg or "图片" in msg):
+        if "生成" in msg or "做" in msg or "制作" in msg or "输出" in msg or "展示" in msg:
+            return "poster_only"
 
     poster_words = ["海报", "配图", "图片", "生成图", "出图", "画图", "封面", "长图"]
     text_words = ["解读", "解析", "总结", "提取", "说明", "哪些", "怎么", "如何", "是否", "为什么"]

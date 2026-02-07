@@ -5,11 +5,12 @@ import asyncio
 import hashlib
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from retrieval_pipe import PolicyRetrievalPipeline, POLICY_QUESTIONS, build_dim_summary_text, generate_one_sentence_summary
 from poster_pipeline import build_poster_records_from_answers
@@ -20,6 +21,11 @@ load_dotenv()
 
 
 router = APIRouter()
+
+
+app = FastAPI()
+app.mount("/files", StaticFiles(directory="./policy_outputs"), name="files")
+app.include_router(router)
 
 
 class PolicyAPIError(Exception):
@@ -155,12 +161,6 @@ def _make_public_file_url(request: Request, local_path: str) -> str:
     return f"{base}{public_prefix}/{rel}"
 
 
-@router.post("/api/policy-intent")
-async def policy_intent(message: str = Form(...)) -> Dict[str, Any]:
-    intent = detect_intent(message)
-    return {"intent": intent}
-
-
 @router.post("/api/policy-interpre")
 async def policy_interpret(
     request: Request,
@@ -169,8 +169,6 @@ async def policy_interpret(
 ) -> StreamingResponse:
     session_id = _get_or_create_session_id(request)
     session_state = _get_session_state(session_id)
-
-    intent: SessionIntent = detect_intent(message)
 
     saved_rel: Optional[str] = None
     inputs: Optional[List[str]] = None
@@ -197,7 +195,7 @@ async def policy_interpret(
                 "messageType": "TEXT",
                 "content": "开始处理...",
             })
-
+            intent: SessionIntent = detect_intent(message)
             def _work() -> Dict[str, Any]:
                 try:
                     if from_cache:

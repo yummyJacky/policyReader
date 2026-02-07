@@ -137,4 +137,5 @@ dmypy.json
 *outputs/
 banana-slides/
 .env
+test_runs/
 READDME copy.md

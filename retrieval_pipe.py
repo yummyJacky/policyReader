@@ -19,10 +19,10 @@ from visual_rag import VisualRAGPipeline
 POLICY_QUESTIONS: Dict[str, str] = {
     "improve_productivity_quality": "根据政策文件，如何提升农业综合生产能力和质量效益？",
     "precise_support": "根据政策文件，如何实施常态化精准帮扶？",
-    "stable_income": "根据政策文件，如何促进农民稳定增收？",
-    "rural_construction": "根据政策文件，如何因地制宜推进宜居宜业和美乡村建设？",
-    "mechanism_innovation": "根据政策文件，如何强化体制机制创新？",
-    "party_leadership": "根据政策文件，如何加强党对‘三农’工作的全面领导？",
+    # "stable_income": "根据政策文件，如何促进农民稳定增收？",
+    # "rural_construction": "根据政策文件，如何因地制宜推进宜居宜业和美乡村建设？",
+    # "mechanism_innovation": "根据政策文件，如何强化体制机制创新？",
+    # "party_leadership": "根据政策文件，如何加强党对‘三农’工作的全面领导？",
 }
 
 
