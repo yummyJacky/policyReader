@@ -3,11 +3,14 @@ import os
 
 # 按照你要求的顺序填写图片路径
 image_paths = [
-    "/home/zechuan/policyReader/policy_outputs/posters/1770174849_cover_tail_0_cover.png",
-    "/home/zechuan/policyReader/policy_outputs/posters/1770174023_what_0.png",
-    "/home/zechuan/policyReader/policy_outputs/posters/1770174066_threshold_0.png",
-    "/home/zechuan/policyReader/policy_outputs/posters/1770174133_compliance_0.png",
-    "/home/zechuan/policyReader/policy_outputs/posters/1770174849_cover_tail_0_tail.png",
+    "/home/zechuan/policyReader/policy_outputs/posters/1770181445_cover_tail_0_cover.png",
+    "/home/zechuan/policyReader/policy_outputs/posters/1770179686_improve_productivity_quality_0.png",
+    "/home/zechuan/policyReader/policy_outputs/posters/1770179744_precise_support_0.png",
+    "/home/zechuan/policyReader/policy_outputs/posters/1770179784_stable_income_0.png",
+    "/home/zechuan/policyReader/policy_outputs/posters/1770179823_rural_construction_0.png",
+    "/home/zechuan/policyReader/policy_outputs/posters/1770179886_mechanism_innovation_0.png",
+    "/home/zechuan/policyReader/policy_outputs/posters/1770179945_party_leadership_0.png",
+    "/home/zechuan/policyReader/policy_outputs/posters/1770181445_cover_tail_0_tail.png",
 ]
 
 # 输出路径可以根据需要改

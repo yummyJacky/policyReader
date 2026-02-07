@@ -2,8 +2,9 @@ import os
 import time
 import json
 import base64
+import concurrent.futures
 from io import BytesIO
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image
 from google import genai
@@ -165,62 +166,80 @@ def build_poster_records_from_answers(
     total_dims = len(dim_keys)
     print(f"[poster_pipeline] 开始根据各维度回答生成海报记录，共 {total_dims} 个维度...")
 
-    # 按 POLICY_QUESTIONS 中的 key 顺序遍历，避免依赖 dim_answers 的内部顺序
-    for idx, dim_key in enumerate(dim_keys, start=1):
-        print(f"[poster_pipeline] ({idx}/{total_dims}) 处理维度: {dim_key} ...")
-        info = dim_answers.get(dim_key) or {}
-        answer = info.get("answer", "")
-        question = info.get("question", POLICY_QUESTIONS.get(dim_key, ""))
+    concurrency = int(os.getenv("POLICY_POSTER_CONCURRENCY", "2"))
+    if concurrency < 1:
+        concurrency = 1
 
-        print("  [poster_pipeline] 判断该维度回答是否包含有效信息...")
-        if not _judge_answer_has_effective_info(answer):
-            print("  [poster_pipeline] 判断结果为无有效信息，跳过该维度。")
-            continue
+    def _process_one_dim(dim_key: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        try:
+            info = dim_answers.get(dim_key) or {}
+            answer = info.get("answer", "")
+            question = info.get("question", POLICY_QUESTIONS.get(dim_key, ""))
 
-        print("  [poster_pipeline] 生成适合海报的精简文案...")
-        short_text = _summarize_answer_for_poster(answer)
-        if not short_text:
-            print("  [poster_pipeline] 精简文案为空，跳过该维度。")
-            continue
+            print(f"  [poster_pipeline] 判断维度 {dim_key} 是否包含有效信息...")
+            if not _judge_answer_has_effective_info(answer):
+                print(f"  [poster_pipeline] 维度 {dim_key} 无有效信息，跳过。")
+                return dim_key, None
 
-        # 为每个维度构造带有明确文本格式约束的文生图提示词，
-        # 以便多次生成的海报在标题/正文结构、字体和排版上尽量保持一致。
+            print(f"  [poster_pipeline] 生成维度 {dim_key} 的精简文案...")
+            short_text = _summarize_answer_for_poster(answer)
+            if not short_text:
+                print(f"  [poster_pipeline] 维度 {dim_key} 精简文案为空，跳过。")
+                return dim_key, None
 
-        # 顶部标题暂时不要，因为现在会自动添加
-        # "- 顶部需要一个简短标题，概括该维度的核心含义，控制在 8~12 个字之内。\n"
-        image_prompt = (
-            "你是一名专业的政策宣传海报设计师，请根据以下信息设计一张单页海报：\n\n"
-            f"[政策维度] {dim_key}\n"
-            f"[问题] {question}\n"
-            "[精简文案]\n"
-            f"{short_text}\n\n"
-            "请严格遵守以下海报中文本格式要求：\n"
-            "- 海报上必须包含清晰可读的中文文字。\n"
-            "- 标题和正文在所有海报中保持统一的字体家族和字号层级。\n"
-            "- 文本排版简洁，避免在同一张海报中使用过多字体或夸张的字号变化。\n"
-            "- 文本颜色保持统一（如深色字体配浅色背景），确保易读性。\n"
-            "- 海报中只能出现与政策内容直接相关的文字，不得自行添加任何机构名称、部门名称、logo、二维码、网站、联系电话、公章或“设计：XXX”等署名信息。\n"
-            "- 不要在海报中出现本提示中的“[问题]”“[精简文案]”等提示性标记，也不要把问题原文或方括号标签直接照抄到画面，只使用精简文案中的关键信息作为正文。\n\n"
-            "只需生成一张符合上述要求、适合打印和展示的高质量竖版政策宣传海报图片。"
-        )
+            image_prompt = (
+                "你是一名专业的政策宣传海报设计师，请根据以下信息设计一张单页海报：\n\n"
+                f"[政策维度] {dim_key}\n"
+                f"[问题] {question}\n"
+                "[精简文案]\n"
+                f"{short_text}\n\n"
+                "请严格遵守以下海报中文本格式要求：\n"
+                "- 海报上必须包含清晰可读的中文文字。\n"
+                "- 标题和正文在所有海报中保持统一的字体家族和字号层级。\n"
+                "- 文本排版简洁，避免在同一张海报中使用过多字体或夸张的字号变化。\n"
+                "- 文本颜色保持统一（如深色字体配浅色背景），确保易读性。\n"
+                "- 海报中只能出现与政策内容直接相关的文字，不得自行添加任何机构名称、部门名称、logo、二维码、网站、联系电话、公章或“设计：XXX”等署名信息。\n"
+                "- 不要在海报中出现本提示中的“[问题]”“[精简文案]”等提示性标记，也不要把问题原文或方括号标签直接照抄到画面，只使用精简文案中的关键信息作为正文。\n\n"
+                "只需生成一张符合上述要求、适合打印和展示的高质量竖版政策宣传海报图片。"
+            )
 
-        print("  [poster_pipeline] 调用文生图 + 多模态校验流程生成海报图片...")
-        image_result = _generate_image_with_verification(
-            dim_key=dim_key,
-            short_text=short_text,
-            image_prompt=image_prompt,
-            max_verify_attempts=max_verify_attempts,
-        )
+            print(f"  [poster_pipeline] 生成维度 {dim_key} 的海报图片...")
+            image_result = _generate_image_with_verification(
+                dim_key=dim_key,
+                short_text=short_text,
+                image_prompt=image_prompt,
+                max_verify_attempts=max_verify_attempts,
+            )
 
-        results[dim_key] = {
-            "question": question,
-            "original_answer": answer,
-            "short_text": short_text,
-            "image_prompt": image_prompt,
-            "image_result": image_result,
-        }
+            return dim_key, {
+                "question": question,
+                "original_answer": answer,
+                "short_text": short_text,
+                "image_prompt": image_prompt,
+                "image_result": image_result,
+            }
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [poster_pipeline] 维度 {dim_key} 生成海报失败: {exc}")
+            return dim_key, None
 
-        print("[poster_pipeline] 维度", dim_key, "处理完成。")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, total_dims)) as ex:
+        future_map = {ex.submit(_process_one_dim, dim_key): dim_key for dim_key in dim_keys}
+        completed: Dict[str, Optional[Dict[str, Any]]] = {}
+        for fut in concurrent.futures.as_completed(future_map):
+            dim_key = future_map[fut]
+            try:
+                k, payload = fut.result()
+                completed[k] = payload
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [poster_pipeline] 维度 {dim_key} 线程异常: {exc}")
+                completed[dim_key] = None
+
+        for dim_key in dim_keys:
+            payload = completed.get(dim_key)
+            if not payload:
+                continue
+            results[dim_key] = payload
+            print("[poster_pipeline] 维度", dim_key, "处理完成。")
 
     print(f"[poster_pipeline] 所有维度处理完成，共生成 {len(results)} 条海报记录。")
     return results

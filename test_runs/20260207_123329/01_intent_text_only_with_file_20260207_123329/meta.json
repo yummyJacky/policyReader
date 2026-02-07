@@ -1,0 +1,15 @@
+{
+  "round_name": "intent_text_only_with_file",
+  "round_index": 1,
+  "message": "解读这个政策文件",
+  "file_path": "policy_data/2026年中央一号文件.docx",
+  "url": "http://127.0.0.1:8000/api/policy-interpre",
+  "round_dir": "test_runs/20260207_123329/01_intent_text_only_with_file_20260207_123329",
+  "stream_path": "test_runs/20260207_123329/01_intent_text_only_with_file_20260207_123329/stream.jsonl",
+  "got_text": true,
+  "got_image": false,
+  "doc_tags": [],
+  "from_cache_flags": [],
+  "got_error": false,
+  "got_done": true
+}

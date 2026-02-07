@@ -421,7 +421,7 @@ class VisualRAGEngine:
 
             # Create prompt
             prompt_template = f"""
-            You are tasked with answering a question based on the relevant pages of a PDF document. Provide your response in the following format:
+            You are tasked with answering a question based on the relevant pages of a PDF document. You must answer all the questions in Chinese. Provide your response in the following format:
             ## Evidence:
 
             ## Chain of Thought:

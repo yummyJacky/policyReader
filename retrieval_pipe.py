@@ -6,15 +6,75 @@ from utils import PDFConverter
 from visual_rag import VisualRAGPipeline
 
 
+# POLICY_QUESTIONS: Dict[str, str] = {
+#     "who": "根据政策文件，申报主体是谁？谁可以申报？请概括主体类型和适用范围。",
+#     "what": "根据政策文件，资金主要用于哪些具体方向或环节？",
+#     "how_much": "根据政策文件，补贴标准和资金上限是多少？",
+#     "threshold": "根据政策文件，申报门槛或硬性指标有哪些？例如规模要求、资质条件等。",
+#     "compliance": "根据政策文件，合规性要求有哪些？是否有禁止情形或红线条款？",
+#     "when": "根据政策文件，本次申报的时间节点和截止日期是什么？是否有分批次安排？",
+#     "how": "根据政策文件，申报流程和需要提交的材料有哪些？请按流程步骤进行梳理。",
+# }
+
 POLICY_QUESTIONS: Dict[str, str] = {
-    "who": "根据政策文件，申报主体是谁？谁可以申报？请概括主体类型和适用范围。",
-    "what": "根据政策文件，资金主要用于哪些具体方向或环节？",
-    "how_much": "根据政策文件，补贴标准和资金上限是多少？",
-    "threshold": "根据政策文件，申报门槛或硬性指标有哪些？例如规模要求、资质条件等。",
-    "compliance": "根据政策文件，合规性要求有哪些？是否有禁止情形或红线条款？",
-    "when": "根据政策文件，本次申报的时间节点和截止日期是什么？是否有分批次安排？",
-    "how": "根据政策文件，申报流程和需要提交的材料有哪些？请按流程步骤进行梳理。",
+    "improve_productivity_quality": "根据政策文件，如何提升农业综合生产能力和质量效益？",
+    "precise_support": "根据政策文件，如何实施常态化精准帮扶？",
+    "stable_income": "根据政策文件，如何促进农民稳定增收？",
+    "rural_construction": "根据政策文件，如何因地制宜推进宜居宜业和美乡村建设？",
+    "mechanism_innovation": "根据政策文件，如何强化体制机制创新？",
+    "party_leadership": "根据政策文件，如何加强党对‘三农’工作的全面领导？",
 }
+
+
+def build_dim_summary_text(dim_answers: Dict[str, Dict[str, str]]) -> str:
+    """根据当前 POLICY_QUESTIONS 定义的维度回答构造用于总结的一段汇总文本。
+
+    会按 POLICY_QUESTIONS 的 key 顺序遍历，优先使用 dim_answers 中的 question 字段作为小标题，
+    如果不存在则退回到 POLICY_QUESTIONS 里的问题文本。
+    """
+
+    lines: List[str] = []
+    for key, question in POLICY_QUESTIONS.items():
+        info = dim_answers.get(key) or {}
+        answer = info.get("answer", "")
+        label = info.get("question") or question or key
+        lines.append(f"【{label}】{answer}")
+
+    return "\n".join(lines)
+
+
+def generate_one_sentence_summary(
+    vis_pipeline: VisualRAGPipeline,
+    dim_answers: Dict[str, Dict[str, str]],
+) -> Dict[str, str]:
+    """基于当前维度回答，调用多模态流水线生成一句话总结。
+
+    该函数会自动根据 POLICY_QUESTIONS 构建汇总文本，而不依赖固定的维度 key，
+    因此当 POLICY_QUESTIONS 被替换为其他问题集合时，无需修改此函数。
+    """
+
+    dim_summary = build_dim_summary_text(dim_answers)
+
+    summary_question = (
+        "下面是刚才针对同一份政策文本、从多个维度给出的回答，请先通读这些内容：\n"
+        f"{dim_summary}\n\n"
+        "请严格基于以上维度的回答，总结一句话结论，概括该政策的核心目标、主要支持方向或关键变化。"
+        "要求：用中文作答，语言简洁有力，只输出这一句话，不要展开成多段。"
+    )
+
+    try:
+        summary_text = vis_pipeline.generate_text_only(summary_question)
+        return {
+            "question": summary_question,
+            "answer": summary_text,
+            "analysis": "",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "question": summary_question,
+            "answer": "",
+            "analysis": f"调用出错: {exc}",
+        }
 
 
 class PolicyRetrievalPipeline:
@@ -157,52 +217,23 @@ class PolicyRetrievalPipeline:
             }
 
         return results
-    def build_dim_summary_text(self,dim_answers: Dict[str, Dict[str, str]]) -> str:
-        """根据七个维度回答构造用于总结的一段汇总文本。"""
 
-        return (
-            "【申报主体（who）】" + dim_answers.get("who", {}).get("answer", "") + "\n"
-            + "【资金用途（what）】" + dim_answers.get("what", {}).get("answer", "") + "\n"
-            + "【补贴标准（how_much）】" + dim_answers.get("how_much", {}).get("answer", "") + "\n"
-            + "【申报门槛（threshold）】" + dim_answers.get("threshold", {}).get("answer", "") + "\n"
-            + "【合规要求（compliance）】" + dim_answers.get("compliance", {}).get("answer", "") + "\n"
-            + "【时间节点（when）】" + dim_answers.get("when", {}).get("answer", "") + "\n"
-            + "【申报流程与材料（how）】" + dim_answers.get("how", {}).get("answer", "")
-        )
+    def build_dim_summary_text(self, dim_answers: Dict[str, Dict[str, str]]) -> str:
+        """实例方法包装：调用模块级 build_dim_summary_text。"""
+
+        return build_dim_summary_text(dim_answers)
 
 
     def generate_one_sentence_summary(
         self,
         dim_answers: Dict[str, Dict[str, str]],
     ) -> Dict[str, str]:
-        """基于七个维度回答，调用多模态流水线生成一句话总结。"""
+        """实例方法包装：调用模块级 generate_one_sentence_summary。"""
 
-        # 确保有可用的 VisualRAGPipeline 实例，即便当前尚未跑过检索流程
         if self._visdom is None:
             self._visdom = VisualRAGPipeline(self._config)
 
-        dim_summary = self.build_dim_summary_text(dim_answers)
-
-        summary_question = (
-            "下面是刚才针对同一份政策文本、从七个维度给出的回答，请先通读这些内容：\n"  # noqa: E501
-            f"{dim_summary}\n\n"
-            "请严格基于以上七个维度的回答，总结一句话结论，概括该政策的核心目标、主要支持方向或关键变化。"  # noqa: E501
-            "要求：用中文作答，语言简洁有力，只输出这一句话，不要展开成多段。"
-        )
-
-        try:
-            summary_text = self._visdom.generate_text_only(summary_question)
-            return {
-                "question": summary_question,
-                "answer": summary_text,
-                "analysis": "",
-            }
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "question": summary_question,
-                "answer": "",
-                "analysis": f"调用出错: {exc}",
-            }
+        return generate_one_sentence_summary(self._visdom, dim_answers)
 
 
 __all__ = [

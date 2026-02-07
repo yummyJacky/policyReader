@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -17,7 +16,6 @@ from retrieval_pipe import (
     build_dim_summary_text,
     generate_one_sentence_summary,
 )
-from policy_interpret_api import router as policy_interpret_router
 
 
 
@@ -217,9 +215,6 @@ app.add_middleware(
     allow_methods=["*"] ,
     allow_headers=["*"],
 )
-
-app.mount("/files", StaticFiles(directory="./policy_outputs"), name="files")
-app.include_router(policy_interpret_router)
 
 
 @app.get("/api/health")
