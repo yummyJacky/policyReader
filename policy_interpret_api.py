@@ -1,19 +1,18 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "8"
 import json
-import asyncio
 import hashlib
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from retrieval_pipe import PolicyRetrievalPipeline, POLICY_QUESTIONS, build_dim_summary_text, generate_one_sentence_summary
-from poster_pipeline import build_poster_records_from_answers
+from poster_pipeline import build_poster_for_dimension
 from policy_intent import SessionIntent, detect_intent
 
 
@@ -24,8 +23,25 @@ router = APIRouter()
 
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://js2.blockelite.cn:17672",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.mount("/files", StaticFiles(directory="./policy_outputs"), name="files")
-app.include_router(router)
+
+
+@router.get("/api/health")
+async def health() -> Dict[str, Any]:
+    return {"status": "ok"}
 
 
 class PolicyAPIError(Exception):
@@ -135,7 +151,17 @@ def _build_policy_pipeline() -> PolicyRetrievalPipeline:
 
 
 def _json_line(payload: Any) -> bytes:
-    return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    # SSE 格式要求以 data: 开头，并以两个换行符结尾
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _text_chunks(text: str, *, chunk_size: int = 200) -> List[str]:
+    if not text:
+        return []
+    s = text.strip("\n")
+    if not s:
+        return []
+    return [s[i : i + chunk_size] for i in range(0, len(s), chunk_size)]
 
 
 def _error_line(code: int, message: str) -> bytes:
@@ -162,7 +188,7 @@ def _make_public_file_url(request: Request, local_path: str) -> str:
 
 
 @router.post("/api/policy-interpre")
-async def policy_interpret(
+def policy_interpret(
     request: Request,
     message: str = Form(...),
     file: Optional[UploadFile] = File(default=None),
@@ -188,141 +214,196 @@ async def policy_interpret(
         else:
             raise HTTPException(status_code=400, detail="请先上传政策文档以进行解析")
 
-    async def _stream() -> AsyncIterator[bytes]:
+    def _stream() -> Iterator[bytes]:
         try:
-            yield _json_line({
-                "type": "RESPONSE",
-                "messageType": "TEXT",
-                "content": "开始处理...",
-            })
             intent: SessionIntent = detect_intent(message)
-            def _work() -> Dict[str, Any]:
-                try:
-                    if from_cache:
-                        partial = session_state.get("dim_answers") or {}
-                        dim_summary = session_state.get("dim_summary") or ""
 
-                        out: Dict[str, Any] = {
-                            "intent": intent,
-                            "dim_answers": partial,
-                            "dim_summary": dim_summary,
-                            "doc_tag": session_state.get("doc_tag"),
-                            "from_cache": True,
-                        }
-
-                        if intent in ["text_and_poster", "poster_only"]:
-                            posters = build_poster_records_from_answers(partial)
-                            out["posters"] = posters
-                        else:
-                            out["posters"] = {}
-
-                        return out
-
-                    pipeline = _build_policy_pipeline()
-                    pipeline.add_inputs(inputs or [])
-                    pipeline._ensure_visdom()  # type: ignore[attr-defined]
-
-                    vis_pipeline = pipeline._visdom  # type: ignore[attr-defined]
-
-                    # 核心逻辑：固定使用 POLICY_QUESTIONS 进行检索和回答
-                    partial: Dict[str, Dict[str, str]] = {}
-                    for key, question in POLICY_QUESTIONS.items():
-                        try:
-                            resp = pipeline._visdom.answer_question(question)  # type: ignore[attr-defined]
-                            if resp is None:
-                                partial[key] = {"question": question, "answer": "", "analysis": ""}
-                            else:
-                                partial[key] = {
-                                    "question": question,
-                                    "answer": resp.get("answer", ""),
-                                    "analysis": resp.get("analysis", ""),
-                                }
-                        except Exception as exc:  # noqa: BLE001
-                            partial[key] = {"question": question, "answer": "", "analysis": f"调用出错: {exc}"}
-
-                    partial["summary"] = generate_one_sentence_summary(vis_pipeline, partial)
-                    dim_summary = build_dim_summary_text(partial)
-                    
-                    out: Dict[str, Any] = {
-                        "intent": intent,
-                        "dim_answers": partial,
-                        "dim_summary": dim_summary,
-                        "doc_tag": session_state.get("doc_tag") or (inputs[0] if inputs else None),
-                        "from_cache": False,
-                    }
-
-                    session_state["dim_answers"] = partial
-                    session_state["dim_summary"] = dim_summary
-
-                    # 如果意图包含海报，则生成海报（完整流水线）
-                    if intent in ["text_and_poster", "poster_only"]:
-                        posters = build_poster_records_from_answers(partial)
-                        out["posters"] = posters
-                    else:
-                        out["posters"] = {}
-
-                    return out
-                except PolicyAPIError:
-                    raise
-                except asyncio.TimeoutError:
-                    raise PolicyAPIError(ERROR_CODES["TIMEOUT"], "响应超时")
-                except Exception as exc:
-                    exc_msg = str(exc).lower()
-                    # 识别模型内部抛出的上下文超限错误（针对豆包/OpenAI/Qwen等常见错误关键字）
-                    if any(x in exc_msg for x in ["context_length_exceeded", "token limit", "context window", "maximum context length", "429"]):
-                        raise PolicyAPIError(ERROR_CODES["TOKEN_LIMIT"], "上下文 token 超出限制")
-                    
-                    if any(x in exc_msg for x in ["auth", "api_key", "401", "unauthorized"]):
-                        raise PolicyAPIError(ERROR_CODES["AUTH_FAILED"], "认证失败")
-                    raise PolicyAPIError(500, f"解析执行失败: {exc}")
-
-            try:
-                result = await asyncio.to_thread(_work)
-            except PolicyAPIError as e:
-                yield _error_line(e.code, e.message)
-                return
-            except Exception as exc:  # noqa: BLE001
-                yield _error_line(500, f"解析执行失败: {exc}")
-                return
-
-            intent = result.get("intent")
+            text_header_sent = False
+            image_header_sent = False
 
             if intent in ["text_only", "text_and_poster"]:
-                # 文本解读输出
-                summary_answer = (result.get("dim_answers", {}).get("summary") or {}).get("answer", "")
-                if summary_answer:
-                    yield _json_line({"type": "RESPONSE", "messageType": "TEXT", "content": summary_answer})
-                
-                dim_summary = result.get("dim_summary") or ""
-                if dim_summary:
-                    yield _json_line({"type": "RESPONSE", "messageType": "TEXT", "content": dim_summary})
+                yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                text_header_sent = True
+                yield _json_line({"content": "开始处理..."})
 
-            if intent in ["text_and_poster", "poster_only"]:
-                # 海报图片输出
-                posters = result.get("posters") or {}
-                idx = 0
-                for dim_key, info in posters.items():
-                    image_path = info.get("image_result")
-                    if not image_path:
-                        continue
-                    idx += 1
-                    yield _json_line({
-                        "type": "RESPONSE",
-                        "messageType": "IMAGE",
-                        "content": {
-                            "title": f"图{idx}({dim_key})",
-                            "url": _make_public_file_url(request, str(image_path)),
-                            "doc_tag": result.get("doc_tag"),
-                            "from_cache": bool(result.get("from_cache")),
-                        },
-                    })
+            partial: Dict[str, Dict[str, str]] = session_state.get("dim_answers") or {}
+            doc_tag = session_state.get("doc_tag")
 
-            yield b"[DONE]\n"
+            if not from_cache:
+                pipeline = _build_policy_pipeline()
+                pipeline.add_inputs(inputs or [])
+                pipeline._ensure_visdom()  # type: ignore[attr-defined]
+                vis_pipeline = pipeline._visdom  # type: ignore[attr-defined]
 
+                for dim_key, question in POLICY_QUESTIONS.items():
+                    try:
+                        if intent in ["text_only", "text_and_poster"]:
+                            if not text_header_sent:
+                                yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                                text_header_sent = True
+                            yield _json_line({"content": f"正在处理：{question}"})
+
+                        resp = vis_pipeline.answer_question(question)
+                        if resp is None:
+                            dim_res = {"question": question, "answer": "", "analysis": ""}
+                        else:
+                            dim_res = {
+                                "question": question,
+                                "answer": resp.get("answer", ""),
+                                "analysis": resp.get("analysis", ""),
+                            }
+                        partial[dim_key] = dim_res
+
+                        if intent in ["text_only", "text_and_poster"]:
+                            # 逐维度输出：先输出问题，再流式输出答案内容
+                            if not text_header_sent:
+                                yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                                text_header_sent = True
+                            yield _json_line({"content": f"【{question}】"})
+                            for chunk in _text_chunks(dim_res.get("answer", "")):
+                                yield _json_line({"content": chunk})
+                    except Exception as exc:  # noqa: BLE001
+                        partial[dim_key] = {
+                            "question": question,
+                            "answer": "",
+                            "analysis": f"调用出错: {exc}",
+                        }
+
+                        if intent in ["text_only", "text_and_poster"]:
+                            if not text_header_sent:
+                                yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                                text_header_sent = True
+                            yield _json_line({"content": f"【{question}】"})
+                            yield _json_line({"content": f"调用出错: {exc}"})
+
+                    # 如果需要海报，做到“每生成一张就推一张”
+                    if intent in ["text_and_poster", "poster_only"]:
+                        try:
+                            if intent == "text_and_poster":
+                                if not text_header_sent:
+                                    yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                                    text_header_sent = True
+                                yield _json_line({"content": f"正在生成海报：{dim_key}"})
+
+                            poster_info = build_poster_for_dimension(dim_key, partial.get(dim_key) or {})
+                            if poster_info and poster_info.get("image_result"):
+                                if not image_header_sent:
+                                    yield _json_line({"type": "RESPONSE", "messageType": "IMAGE"})
+                                    image_header_sent = True
+                                yield _json_line({
+                                    "content": {
+                                        "title": f"{dim_key}",
+                                        "url": _make_public_file_url(
+                                            request, str(poster_info["image_result"])
+                                        ),
+                                        "doc_tag": doc_tag,
+                                        "from_cache": from_cache,
+                                    }
+                                })
+                        except Exception:
+                            pass
+
+                try:
+                    partial["summary"] = generate_one_sentence_summary(vis_pipeline, partial)
+                except Exception as exc:  # noqa: BLE001
+                    partial["summary"] = {
+                        "question": "",
+                        "answer": "",
+                        "analysis": f"调用出错: {exc}",
+                    }
+
+                dim_summary = build_dim_summary_text(partial)
+                session_state["dim_answers"] = partial
+                session_state["dim_summary"] = dim_summary
+
+                if intent in ["text_only", "text_and_poster"]:
+                    summary_text = (partial.get("summary") or {}).get("answer", "")
+                    if summary_text:
+                        if not text_header_sent:
+                            yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                            text_header_sent = True
+                        yield _json_line({"content": "【总结】"})
+                        for chunk in _text_chunks(summary_text):
+                            yield _json_line({"content": chunk})
+                    if dim_summary:
+                        if not text_header_sent:
+                            yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                            text_header_sent = True
+                        yield _json_line({"content": "【维度汇总】"})
+                        for chunk in _text_chunks(dim_summary):
+                            yield _json_line({"content": chunk})
+
+            else:
+                # 直接把缓存的维度答案逐条推给前端
+
+                if intent in ["text_only", "text_and_poster"]:
+                    for dim_key, dim_res in partial.items():
+                        if dim_key == "summary":
+                            continue
+                        q = dim_res.get("question", "")
+                        a = dim_res.get("answer", "")
+                        if q:
+                            if not text_header_sent:
+                                yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                                text_header_sent = True
+                            yield _json_line({"content": f"【{q}】"})
+                        for chunk in _text_chunks(a):
+                            yield _json_line({"content": chunk})
+
+                    cached_dim_summary = session_state.get("dim_summary") or ""
+                    summary_text = (partial.get("summary") or {}).get("answer", "")
+                    if summary_text:
+                        if not text_header_sent:
+                            yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                            text_header_sent = True
+                        yield _json_line({"content": "【总结】"})
+                        for chunk in _text_chunks(summary_text):
+                            yield _json_line({"content": chunk})
+                    if cached_dim_summary:
+                        if not text_header_sent:
+                            yield _json_line({"type": "RESPONSE", "messageType": "TEXT"})
+                            text_header_sent = True
+                        yield _json_line({"content": "【维度汇总】"})
+                        for chunk in _text_chunks(cached_dim_summary):
+                            yield _json_line({"content": chunk})
+
+                if intent in ["text_and_poster", "poster_only"]:
+                    # 缓存模式下：按维度逐张生成并输出图片
+                    for dim_key in POLICY_QUESTIONS.keys():
+                        try:
+                            poster_info = build_poster_for_dimension(dim_key, partial.get(dim_key) or {})
+                            if poster_info and poster_info.get("image_result"):
+                                if not image_header_sent:
+                                    yield _json_line({"type": "RESPONSE", "messageType": "IMAGE"})
+                                    image_header_sent = True
+                                yield _json_line({
+                                    "content": {
+                                        "title": f"{dim_key}",
+                                        "url": _make_public_file_url(
+                                            request, str(poster_info["image_result"])
+                                        ),
+                                        "doc_tag": doc_tag,
+                                        "from_cache": from_cache,
+                                    }
+                                })
+                        except Exception:
+                            continue
+
+            yield b"data: [DONE]\n\n"
+
+        except PolicyAPIError as e:
+            yield _json_line({"type": "ERROR", "messageType": "TEXT"})
+            yield _json_line({"content": json.dumps({"code": e.code, "message": e.message}, ensure_ascii=False)})
+            yield b"data: [DONE]\n\n"
         except Exception as e:
-            yield _error_line(500, f"服务器内部错误: {e}")
+            yield _json_line({"type": "ERROR", "messageType": "TEXT"})
+            yield _json_line({"content": json.dumps({"code": 500, "message": f"服务器内部错误: {e}"}, ensure_ascii=False)})
+            yield b"data: [DONE]\n\n"
 
-    resp = StreamingResponse(_stream(), media_type="text/plain; charset=utf-8")
+    resp = StreamingResponse(_stream(), media_type="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Connection"] = "keep-alive"
     resp.set_cookie(
         key="policy_session",
         value=session_id,
@@ -330,3 +411,7 @@ async def policy_interpret(
         samesite="lax",
     )
     return resp
+
+
+app.include_router(router)
+
