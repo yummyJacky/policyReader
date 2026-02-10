@@ -4,6 +4,7 @@ import hashlib
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
+import logging
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -12,11 +13,17 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from retrieval_pipe import PolicyRetrievalPipeline, POLICY_QUESTIONS, build_dim_summary_text, generate_one_sentence_summary
-from poster_pipeline import build_poster_for_dimension
+from poster_pipeline import (
+    build_poster_for_dimension,
+    concat_poster_images,
+    generate_cover_and_tail_from_single_image,
+)
 from policy_intent import SessionIntent, detect_intent
 
 
 load_dotenv()
+
+logger = logging.getLogger("uvicorn.error")
 
 
 router = APIRouter()
@@ -30,6 +37,8 @@ app.add_middleware(
         "http://js2.blockelite.cn:17672",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
+        "http://localhost:3000",
+        "http://139.159.236.86:8090"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -62,7 +71,7 @@ SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
 def _get_or_create_session_id(request: Request) -> str:
-    sid = request.cookies.get("policy_session")
+    sid = request.cookies.get("session_id")
     if sid:
         return sid
     return uuid.uuid4().hex
@@ -188,11 +197,37 @@ def _make_public_file_url(request: Request, local_path: str) -> str:
 
 
 @router.post("/api/policy-interpre")
-def policy_interpret(
+async def policy_interpret(
     request: Request,
-    message: str = Form(...),
-    file: Optional[UploadFile] = File(default=None),
+    message: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
 ) -> StreamingResponse:
+    # 强制手动解析逻辑，因为 FastAPI 在混合 Form/File 时对 JSON 的自动支持很弱
+    content_type = request.headers.get("content-type", "").lower()
+    
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                # 尝试从各种可能的字段名中获取 message
+                message = body.get("message") or body.get("prompt") or body.get("query") or body.get("text")
+                if not message and "data" in body and isinstance(body["data"], dict):
+                    message = body["data"].get("message")
+        except Exception:
+            logger.error("Failed to parse JSON body")
+    
+    # 如果是 Form 数据，FastAPI 已经将 message 注入到变量中了，无需额外操作
+
+    if message is None:
+        logger.info(
+            "Missing message field. content-type=%s",
+            request.headers.get("content-type"),
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="缺少 message 字段（支持 form-data 的 message 或 JSON 的 {\"message\": ...}）",
+        )
+
     session_id = _get_or_create_session_id(request)
     session_state = _get_session_state(session_id)
 
@@ -228,6 +263,8 @@ def policy_interpret(
 
             partial: Dict[str, Dict[str, str]] = session_state.get("dim_answers") or {}
             doc_tag = session_state.get("doc_tag")
+
+            posters_generated: Dict[str, Dict[str, Any]] = {}
 
             if not from_cache:
                 pipeline = _build_policy_pipeline()
@@ -275,6 +312,7 @@ def policy_interpret(
                                 text_header_sent = True
                             yield _json_line({"content": f"【{question}】"})
                             yield _json_line({"content": f"调用出错: {exc}"})
+                        logger.exception("dim=%s question=%s answer_question failed", dim_key, question)
 
                     # 如果需要海报，做到“每生成一张就推一张”
                     if intent in ["text_and_poster", "poster_only"]:
@@ -287,6 +325,7 @@ def policy_interpret(
 
                             poster_info = build_poster_for_dimension(dim_key, partial.get(dim_key) or {})
                             if poster_info and poster_info.get("image_result"):
+                                posters_generated[dim_key] = poster_info
                                 if not image_header_sent:
                                     yield _json_line({"type": "RESPONSE", "messageType": "IMAGE"})
                                     image_header_sent = True
@@ -301,7 +340,7 @@ def policy_interpret(
                                     }
                                 })
                         except Exception:
-                            pass
+                            logger.exception("dim=%s build_poster_for_dimension failed (live mode)", dim_key)
 
                 try:
                     partial["summary"] = generate_one_sentence_summary(vis_pipeline, partial)
@@ -373,6 +412,7 @@ def policy_interpret(
                         try:
                             poster_info = build_poster_for_dimension(dim_key, partial.get(dim_key) or {})
                             if poster_info and poster_info.get("image_result"):
+                                posters_generated[dim_key] = poster_info
                                 if not image_header_sent:
                                     yield _json_line({"type": "RESPONSE", "messageType": "IMAGE"})
                                     image_header_sent = True
@@ -386,16 +426,71 @@ def policy_interpret(
                                         "from_cache": from_cache,
                                     }
                                 })
-                        except Exception:
+                        except Exception as e:
+                            logger.exception("dim=%s build_poster_for_dimension failed (cache mode)", dim_key, exc_info=True)
                             continue
+
+            # 生成可下载的长图：封面 + 各维度 + 尾页
+            if intent in ["text_and_poster", "poster_only"] and posters_generated:
+                try:
+                    title = "政策解读"
+                    if saved_rel:
+                        try:
+                            title = Path(saved_rel).stem or title
+                        except Exception:
+                            title = title
+                    elif doc_tag:
+                        title = str(doc_tag)
+
+                    summary_text = ""
+                    try:
+                        summary_text = ((partial.get("summary") or {}).get("answer") or "").strip()
+                    except Exception:
+                        summary_text = ""
+                    if not summary_text:
+                        summary_text = (session_state.get("dim_summary") or "").strip()
+                        if summary_text:
+                            summary_text = summary_text.split("\n", 1)[0].strip()
+
+                    cover_path, tail_path = generate_cover_and_tail_from_single_image(
+                        title=title,
+                        summary=summary_text,
+                        output_dir="./policy_outputs/posters",
+                    )
+
+                    out_name = f"long_{doc_tag or 'poster'}.png"
+                    out_path = os.path.join("./policy_outputs/posters", out_name)
+                    long_path = concat_poster_images(
+                        posters_generated,
+                        out_path,
+                        cover_image=cover_path or None,
+                        tail_image=tail_path or None,
+                    )
+                    if long_path:
+                        if not image_header_sent:
+                            yield _json_line({"type": "RESPONSE", "messageType": "IMAGE"})
+                            image_header_sent = True
+                        yield _json_line({
+                            "content": {
+                                "title": "download_long_poster",
+                                "url": _make_public_file_url(request, str(long_path)),
+                                "doc_tag": doc_tag,
+                                "from_cache": from_cache,
+                            }
+                        })
+                        session_state["long_poster"] = long_path
+                except Exception:
+                    logger.exception("build long poster failed")
 
             yield b"data: [DONE]\n\n"
 
         except PolicyAPIError as e:
+            logger.exception("PolicyAPIError")
             yield _json_line({"type": "ERROR", "messageType": "TEXT"})
             yield _json_line({"content": json.dumps({"code": e.code, "message": e.message}, ensure_ascii=False)})
             yield b"data: [DONE]\n\n"
         except Exception as e:
+            logger.exception("Unhandled exception in policy_interpret")
             yield _json_line({"type": "ERROR", "messageType": "TEXT"})
             yield _json_line({"content": json.dumps({"code": 500, "message": f"服务器内部错误: {e}"}, ensure_ascii=False)})
             yield b"data: [DONE]\n\n"

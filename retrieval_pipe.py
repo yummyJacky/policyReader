@@ -2,6 +2,10 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from realtime_logger import get_logger
+
+logger = get_logger("retrieval_pipe")
+
 from utils import PDFConverter
 from visual_rag import VisualRAGPipeline
 
@@ -16,15 +20,22 @@ from visual_rag import VisualRAGPipeline
 #     "how": "根据政策文件，申报流程和需要提交的材料有哪些？请按流程步骤进行梳理。",
 # }
 
+# POLICY_QUESTIONS: Dict[str, str] = {
+#     "improve_productivity_quality": "根据政策文件，如何提升农业综合生产能力和质量效益？",
+#     "precise_support": "根据政策文件，如何实施常态化精准帮扶？",
+#     "stable_income": "根据政策文件，如何促进农民稳定增收？",
+#     "rural_construction": "根据政策文件，如何因地制宜推进宜居宜业和美乡村建设？",
+#     "mechanism_innovation": "根据政策文件，如何强化体制机制创新？",
+#     "party_leadership": "根据政策文件，如何加强党对‘三农’工作的全面领导？",
+# }
 POLICY_QUESTIONS: Dict[str, str] = {
-    "improve_productivity_quality": "根据政策文件，如何提升农业综合生产能力和质量效益？",
-    "precise_support": "根据政策文件，如何实施常态化精准帮扶？",
-    # "stable_income": "根据政策文件，如何促进农民稳定增收？",
-    # "rural_construction": "根据政策文件，如何因地制宜推进宜居宜业和美乡村建设？",
-    # "mechanism_innovation": "根据政策文件，如何强化体制机制创新？",
-    # "party_leadership": "根据政策文件，如何加强党对‘三农’工作的全面领导？",
+    "01": "时代背景：为何聚焦数据流通？",
+    "02": "政策总览：国家顶层设计与战略部署",
+    "03": "核心解读：三类数据流通服务机构定位",
+    "04": "实施路径：八大能力提升与生态构建",
+    "05": "安全保障：数据安全与跨境流动机制",
+    "06": "挑战与展望：机遇、挑战与未来趋势"
 }
-
 
 def build_dim_summary_text(dim_answers: Dict[str, Dict[str, str]]) -> str:
     """根据当前 POLICY_QUESTIONS 定义的维度回答构造用于总结的一段汇总文本。
@@ -206,15 +217,18 @@ class PolicyRetrievalPipeline:
 
         results: Dict[str, Dict[str, str]] = {}
         for key, question in POLICY_QUESTIONS.items():
+            logger.info(f"[retrieval_pipe] Retrieving answer for question: {question}")
             response = self._visdom.answer_question(question)
             if response is None:
                 results[key] = {"question": question, "answer": "", "analysis": ""}
+                logger.info(f"[retrieval_pipe] No answer found for question: {question}")
                 continue
             results[key] = {
                 "question": question,
                 "answer": response.get("answer", ""),
                 "analysis": response.get("analysis", ""),
             }
+            logger.info(f"[retrieval_pipe] Answer found for question: {question}")
 
         return results
 

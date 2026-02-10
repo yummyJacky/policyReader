@@ -2,9 +2,10 @@ import os
 import time
 import json
 import base64
-import concurrent.futures
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
+import functools
+import logging
 
 from PIL import Image
 from google import genai
@@ -12,17 +13,46 @@ from google.genai import types
 from openai import OpenAI
 from dotenv import load_dotenv
 from retrieval_pipe import POLICY_QUESTIONS
-import logging
 
 load_dotenv()
-logger = logging.getLogger("VisDoMRAG")
+from realtime_logger import get_logger
+
+logger = get_logger("poster_pipeline")
 llm = OpenAI(
-        base_url="https://ark.cn-beijing.volces.com/api/v3",
-        api_key=os.getenv("ARK_API_KEY"),
-    )
+    base_url="https://ark.cn-beijing.volces.com/api/v3",
+    api_key=os.getenv("ARK_API_KEY"),
+)
 
 # BACKGROUND_IMAGE_PATH = "./assets/background.png"
 BACKGROUND_IMAGE_PATH = None
+
+# ────────────────────────── 风格一致性 prompt 片段 ──────────────────────────
+_STYLE_CONSISTENCY_INSTRUCTION = (
+    "\n\n[风格一致性要求]\n"
+    "我已提供了一张或多张参考图片。你生成的海报必须与这些参考图片在以下方面保持高度一致：\n"
+    "- 整体配色方案（主色调、辅助色、背景色）；\n"
+    "- 插画/图形风格（如扁平、拟物、3D 等）；\n"
+    "- 版式布局结构（如标题位置、内容区域划分、留白比例）；\n"
+    "- 字体风格与字号层级（标题与正文的对比关系）；\n"
+    "- 装饰元素的类型与密度（如圆角卡片、色块、图标等）。\n"
+    "请确保生成的图片看起来与参考图片属于同一系列/同一套模板。\n"
+)
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_gemini_image_generator(
+    model: str = "gemini-3-pro-image-preview",
+    output_dir: str = "./policy_outputs/posters",
+) -> Callable[[str, str, Any | None], str]:
+    return make_gemini_image_generator(model=model, output_dir=output_dir)
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_doubao_image_verifier(
+    model: str = "doubao-seed-1-6-flash-250828",
+) -> Callable[[str, str, str], bool]:
+    return make_doubao_image_verifier(model=model)
+
 
 def generate_text_only(prompt) -> str:
     try:
@@ -48,6 +78,7 @@ def generate_text_only(prompt) -> str:
         logger.error(f"Error in generate_text: {str(e)}")
         return ""
 
+
 def _judge_answer_has_effective_info(
     answer: str,
 ) -> bool:
@@ -58,7 +89,7 @@ def _judge_answer_has_effective_info(
         "下面是针对某个政策维度的模型回答：\n\n"
         f"{answer}\n\n"
         "请判断该回答是否表明政策文件中**包含**该维度的具体有效信息，"
-        "还是明确说明“政策未提及/无法从中提取/未给出具体内容”等情况。\n"
+        "还是明确说明\"政策未提及/无法从中提取/未给出具体内\"等情况。\n"
         "如果包含有效信息，请只输出：有信息\n"
         "如果属于未提及或无法提取，请只输出：无信息\n"
         "不要输出任何其它内容。"
@@ -84,30 +115,67 @@ def _summarize_answer_for_poster(
     return generate_text_only(refine_prompt)
 
 
+# ────────────────────────── 辅助：合并风格参照图列表 ──────────────────────────
+
+def _merge_image_inputs(*sources: Any) -> List[Any] | None:
+    """将多个图片来源合并为一个扁平列表，去重（按路径字符串去重）。"""
+    merged: List[Any] = []
+    seen_paths: set[str] = set()
+
+    for src in sources:
+        if src is None:
+            continue
+        items = src if isinstance(src, (list, tuple)) else [src]
+        for item in items:
+            if isinstance(item, str):
+                if item and item not in seen_paths:
+                    seen_paths.add(item)
+                    merged.append(item)
+            elif isinstance(item, Image.Image):
+                merged.append(item)
+
+    return merged if merged else None
+
+
 def _generate_image_with_verification(
     dim_key: str,
     short_text: str,
     image_prompt: str,
     image_input: str | None = None,
+    style_reference: Any | None = None,
     max_verify_attempts: int = 2,
 ) -> Any:
     """使用 Gemini 文生图 + Doubao 多模态校验生成单个维度的海报。
 
+    Parameters
+    ----------
+    style_reference : 已生成的风格参照图（路径或 PIL Image），将与 image_input/背景图一同
+                      传给 Gemini，并在 prompt 中追加风格一致性要求。
     """
 
-    print(f"[poster_pipeline] 开始为维度 {dim_key} 生成海报，最多重试 {max_verify_attempts} 次 (Gemini 文生图 + Doubao 校验)...")
+    print(
+        f"[poster_pipeline] 开始为维度 {dim_key} 生成海报，最多重试 {max_verify_attempts} 次 "
+        "(Gemini 文生图 + Doubao 校验)..."
+    )
 
-    image_generator = make_gemini_image_generator()
-    image_verifier = make_doubao_image_verifier()
+    image_generator = _cached_gemini_image_generator()
+    image_verifier = _cached_doubao_image_verifier()
+
+    # ── 合并所有图片输入：背景 + 外部 image_input + 风格参照 ──
+    bg_input = image_input or BACKGROUND_IMAGE_PATH
+    combined_input = _merge_image_inputs(bg_input, style_reference)
+
+    # ── 如果存在风格参照，给 prompt 追加风格一致性要求 ──
+    final_prompt = image_prompt
+    if style_reference is not None:
+        final_prompt = image_prompt + _STYLE_CONSISTENCY_INSTRUCTION
 
     image_result: Any = None
     attempts = 0
 
     while attempts < max_verify_attempts:
         print(f"  [poster_pipeline] 第 {attempts + 1} 次生成维度 {dim_key} 的图片...")
-        # 为所有维度海报统一提供相同的背景示例图片，确保整体背景风格一致。
-        bg_input = image_input or BACKGROUND_IMAGE_PATH
-        candidate = image_generator(dim_key, image_prompt, bg_input)
+        candidate = image_generator(dim_key, final_prompt, combined_input)
         image_result = candidate
 
         if not candidate or image_verifier is None:
@@ -135,130 +203,198 @@ def _generate_image_with_verification(
     return image_result
 
 
+def build_poster_for_dimension(
+    dim_key: str,
+    dim_info: Dict[str, str],
+    image_input: str | None = None,
+    style_reference: Any | None = None,
+    max_verify_attempts: int = 2,
+) -> Optional[Dict[str, Any]]:
+    """为单个维度生成海报。
+
+    Parameters
+    ----------
+    style_reference : 已生成的风格参照图（路径、PIL Image 或列表），用于保证本次
+                      生成的海报与之前已生成的海报风格保持一致。
+    """
+    logger.info("[poster_pipeline] Building poster for dimension: %s", dim_key)
+    answer = dim_info.get("answer", "")
+    question = dim_info.get("question", POLICY_QUESTIONS.get(dim_key, ""))
+
+    print(f"  [poster_pipeline] 判断该维度回答是否包含有效信息: {dim_key} ...")
+    if not _judge_answer_has_effective_info(answer):
+        print("  [poster_pipeline] 判断结果为无有效信息，跳过该维度。")
+        return None
+
+    print("  [poster_pipeline] 生成适合海报的精简文案...")
+    short_text = _summarize_answer_for_poster(answer)
+    if not short_text:
+        print("  [poster_pipeline] 精简文案为空，跳过该维度。")
+        return None
+
+    image_prompt = (
+        "你是一名专业的政策宣传海报设计师，请根据以下信息设计一张单页海报：\n\n"
+        f"[政策维度] {dim_key}\n"
+        f"[问题] {question}\n"
+        "[精简文案]\n"
+        f"{short_text}\n\n"
+        "请严格遵守以下海报中文本格式要求：\n"
+        "- 海报上必须包含清晰可读的中文文字。\n"
+        "- 标题和正文在所有海报中保持统一的字体家族和字号层级。\n"
+        "- 文本排版简洁，避免在同一张海报中使用过多字体或夸张的字号变化。\n"
+        "- 文本颜色保持统一（如深色字体配浅色背景），确保易读性。\n"
+        "- 海报中只能出现与政策内容直接相关的文字，不得自行添加任何机构名称、部门名称、logo、二维码、网站、联系电话、公章或“设计：XXX”等署名信息。\n"
+        "- 不要在海报中出现本提示中的\"[问题]\"\"[精简文案]\"等提示性标记，也不要把问题原文或方括号标签直接照抄到画面，只使用精简文案中的关键信息作为正文。\n\n"
+        "只需生成一张符合上述要求、适合打印和展示的高质量竖版政策宣传海报图片。"
+    )
+
+    print("  [poster_pipeline] 调用文生图 + 多模态校验流程生成海报图片...")
+    image_result = _generate_image_with_verification(
+        dim_key=dim_key,
+        short_text=short_text,
+        image_prompt=image_prompt,
+        image_input=image_input,
+        style_reference=style_reference,
+        max_verify_attempts=max_verify_attempts,
+    )
+
+    return {
+        "question": question,
+        "original_answer": answer,
+        "short_text": short_text,
+        "image_prompt": image_prompt,
+        "image_result": image_result,
+    }
+
+
 def build_poster_records_from_answers(
     dim_answers: Dict[str, Dict[str, str]],
     max_verify_attempts: int = 2,
+    style_reference: Any | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     """根据七个维度的回答，生成海报所需的精简文案与文生图提示词。
 
-    参数：
-    - dim_answers: 结构类似于 policy_api_fastapi._run_job 里的 partial：
-        {
-            "who": {"question": "...", "answer": "...", "analysis": "..."},
-            ...
-        }
-    - max_verify_attempts: 单个维度在“生成海报 + 校验”上的最大尝试次数。
-
-    返回：
-    - 一个字典，key 为维度 key（如 who/what/...），value 包含：
-        {
-            "question": 原问题,
-            "original_answer": 原始回答,
-            "short_text": 适合海报的精简文案,
-            "image_prompt": 文生图提示词,
-            "image_result": 生成的海报图片路径
-        }
+    Parameters
+    ----------
+    style_reference : 外部提供的风格参照图（路径、PIL Image 或列表）。
+                      如果提供，则所有维度的海报都会以该图片为风格基准。
+                      此外，第一张成功生成的海报也会自动加入风格参照列表，
+                      以确保后续维度的海报与之保持一致。
     """
 
     results: Dict[str, Dict[str, Any]] = {}
 
     dim_keys = list(POLICY_QUESTIONS.keys())
     total_dims = len(dim_keys)
-    print(f"[poster_pipeline] 开始根据各维度回答生成海报记录，共 {total_dims} 个维度...")
+    logger.info(
+        "[poster_pipeline] Starting to generate poster records for %d dimensions...",
+        total_dims,
+    )
 
-    concurrency = int(os.getenv("POLICY_POSTER_CONCURRENCY", "2"))
-    if concurrency < 1:
-        concurrency = 1
+    # ── 用于在维度之间传递风格参照的列表 ──
+    # 初始值为外部传入的 style_reference（如果有的话）
+    accumulated_style_refs: List[Any] = []
+    if style_reference is not None:
+        if isinstance(style_reference, (list, tuple)):
+            accumulated_style_refs.extend(style_reference)
+        else:
+            accumulated_style_refs.append(style_reference)
 
-    def _process_one_dim(dim_key: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-        try:
-            info = dim_answers.get(dim_key) or {}
-            answer = info.get("answer", "")
-            question = info.get("question", POLICY_QUESTIONS.get(dim_key, ""))
+    for idx, dim_key in enumerate(dim_keys, start=1):
+        logger.info(
+            "[poster_pipeline] Processing dimension %s (%d/%d)...",
+            dim_key,
+            idx,
+            total_dims,
+        )
+        info = dim_answers.get(dim_key) or {}
+        answer = info.get("answer", "")
+        question = info.get("question", POLICY_QUESTIONS.get(dim_key, ""))
 
-            print(f"  [poster_pipeline] 判断维度 {dim_key} 是否包含有效信息...")
-            if not _judge_answer_has_effective_info(answer):
-                print(f"  [poster_pipeline] 维度 {dim_key} 无有效信息，跳过。")
-                return dim_key, None
+        print("  [poster_pipeline] 判断该维度回答是否包含有效信息...")
+        if not _judge_answer_has_effective_info(answer):
+            print("  [poster_pipeline] 判断结果为无有效信息，跳过该维度。")
+            continue
 
-            print(f"  [poster_pipeline] 生成维度 {dim_key} 的精简文案...")
-            short_text = _summarize_answer_for_poster(answer)
-            if not short_text:
-                print(f"  [poster_pipeline] 维度 {dim_key} 精简文案为空，跳过。")
-                return dim_key, None
+        print("  [poster_pipeline] 生成适合海报的精简文案...")
+        short_text = _summarize_answer_for_poster(answer)
+        if not short_text:
+            print("  [poster_pipeline] 精简文案为空，跳过该维度。")
+            continue
 
-            image_prompt = (
-                "你是一名专业的政策宣传海报设计师，请根据以下信息设计一张单页海报：\n\n"
-                f"[政策维度] {dim_key}\n"
-                f"[问题] {question}\n"
-                "[精简文案]\n"
-                f"{short_text}\n\n"
-                "请严格遵守以下海报中文本格式要求：\n"
-                "- 海报上必须包含清晰可读的中文文字。\n"
-                "- 标题和正文在所有海报中保持统一的字体家族和字号层级。\n"
-                "- 文本排版简洁，避免在同一张海报中使用过多字体或夸张的字号变化。\n"
-                "- 文本颜色保持统一（如深色字体配浅色背景），确保易读性。\n"
-                "- 海报中只能出现与政策内容直接相关的文字，不得自行添加任何机构名称、部门名称、logo、二维码、网站、联系电话、公章或“设计：XXX”等署名信息。\n"
-                "- 不要在海报中出现本提示中的“[问题]”“[精简文案]”等提示性标记，也不要把问题原文或方括号标签直接照抄到画面，只使用精简文案中的关键信息作为正文。\n\n"
-                "只需生成一张符合上述要求、适合打印和展示的高质量竖版政策宣传海报图片。"
+        image_prompt = (
+            "你是一名专业的政策宣传海报设计师，请根据以下信息设计一张单页海报：\n\n"
+            f"[政策维度] {dim_key}\n"
+            f"[问题] {question}\n"
+            "[精简文案]\n"
+            f"{short_text}\n\n"
+            "请严格遵守以下海报中文本格式要求：\n"
+            "- 海报上必须包含清晰可读的中文文字。\n"
+            "- 标题和正文在所有海报中保持统一的字体家族和字号层级。\n"
+            "- 文本排版简洁，避免在同一张海报中使用过多字体或夸张的字号变化。\n"
+            "- 文本颜色保持统一（如深色字体配浅色背景），确保易读性。\n"
+            "- 海报中只能出现与政策内容直接相关的文字，不得自行添加任何机构名称、部门名称、logo、二维码、网站、联系电话、公章或“设计：XXX”等署名信息。\n"
+            "- 不要在海报中出现本提示中的\"[问题]\"\"[精简文案]\"等提示性标记，也不要把问题原文或方括号标签直接照抄到画面，只使用精简文案中的关键信息作为正文。\n\n"
+            "只需生成一张符合上述要求、适合打印和展示的高质量竖版政策宣传海报图片。"
+        )
+
+        # ── 将当前已积累的风格参照传给生成函数 ──
+        current_style_ref = accumulated_style_refs if accumulated_style_refs else None
+
+        print("  [poster_pipeline] 调用文生图 + 多模态校验流程生成海报图片...")
+        image_result = _generate_image_with_verification(
+            dim_key=dim_key,
+            short_text=short_text,
+            image_prompt=image_prompt,
+            style_reference=current_style_ref,
+            max_verify_attempts=max_verify_attempts,
+        )
+
+        # ── 将成功生成的海报图片加入风格参照列表，供后续维度使用 ──
+        if image_result and isinstance(image_result, str) and os.path.exists(image_result):
+            # 只保留最近一张作为主要风格参照（避免传入过多图片影响生成效果）
+            # 但仍保留外部传入的 style_reference
+            _external = []
+            if style_reference is not None:
+                if isinstance(style_reference, (list, tuple)):
+                    _external.extend(style_reference)
+                else:
+                    _external.append(style_reference)
+            accumulated_style_refs = _external + [image_result]
+            print(
+                f"  [poster_pipeline] 已将 {dim_key} 的海报加入风格参照列表，"
+                f"当前参照数量: {len(accumulated_style_refs)}"
             )
 
-            print(f"  [poster_pipeline] 生成维度 {dim_key} 的海报图片...")
-            image_result = _generate_image_with_verification(
-                dim_key=dim_key,
-                short_text=short_text,
-                image_prompt=image_prompt,
-                max_verify_attempts=max_verify_attempts,
-            )
+        results[dim_key] = {
+            "question": question,
+            "original_answer": answer,
+            "short_text": short_text,
+            "image_prompt": image_prompt,
+            "image_result": image_result,
+        }
 
-            return dim_key, {
-                "question": question,
-                "original_answer": answer,
-                "short_text": short_text,
-                "image_prompt": image_prompt,
-                "image_result": image_result,
-            }
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [poster_pipeline] 维度 {dim_key} 生成海报失败: {exc}")
-            return dim_key, None
+        logger.info("[poster_pipeline] Dimension %s processed.", dim_key)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, total_dims)) as ex:
-        future_map = {ex.submit(_process_one_dim, dim_key): dim_key for dim_key in dim_keys}
-        completed: Dict[str, Optional[Dict[str, Any]]] = {}
-        for fut in concurrent.futures.as_completed(future_map):
-            dim_key = future_map[fut]
-            try:
-                k, payload = fut.result()
-                completed[k] = payload
-            except Exception as exc:  # noqa: BLE001
-                print(f"  [poster_pipeline] 维度 {dim_key} 线程异常: {exc}")
-                completed[dim_key] = None
-
-        for dim_key in dim_keys:
-            payload = completed.get(dim_key)
-            if not payload:
-                continue
-            results[dim_key] = payload
-            print("[poster_pipeline] 维度", dim_key, "处理完成。")
-
-    print(f"[poster_pipeline] 所有维度处理完成，共生成 {len(results)} 条海报记录。")
+    logger.info(
+        "[poster_pipeline] All dimensions processed, %d poster records generated.",
+        len(results),
+    )
     return results
 
 
 def build_poster_records_from_answers_json(
     json_path: str,
     max_verify_attempts: int = 2,
+    style_reference: Any | None = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """从包含七个维度回答的 JSON/JSONL 文件中构建海报记录。
+    """从包含七个维度回答的 JSON/JSONL 文件中构建海报记录。"""
 
-    JSONL 文件（多个维度，每行一个 JSON 对象）：
-    每一行都是上面的结构，第 1 行 -> who，第 2 行 -> what，依此类推，
-    按 POLICY_QUESTIONS 的 key 顺序依次映射。
-    """
+    logger.info(
+        "[poster_pipeline] Loading seven-dimensional answers from JSON file: %s",
+        json_path,
+    )
 
-    print(f"[poster_pipeline] 从 JSON 文件加载七维度回答: {json_path}")
-
-    # JSONL，多行多维度
     if json_path.endswith(".jsonl"):
         dim_keys = list(POLICY_QUESTIONS.keys())
         dim_answers: Dict[str, Dict[str, Any]] = {}
@@ -268,18 +404,14 @@ def build_poster_records_from_answers_json(
                 line = line.strip()
                 if not line:
                     continue
-
                 try:
                     obj = json.loads(line)
                 except Exception:
                     continue
-
                 if not isinstance(obj, dict):
                     continue
-
                 if idx >= len(dim_keys):
                     break
-
                 dim_key = dim_keys[idx]
                 dim_answers[dim_key] = obj
 
@@ -289,6 +421,7 @@ def build_poster_records_from_answers_json(
         return build_poster_records_from_answers(
             dim_answers=dim_answers,
             max_verify_attempts=max_verify_attempts,
+            style_reference=style_reference,
         )
 
 
@@ -296,10 +429,7 @@ def make_gemini_image_generator(
     model: str = "gemini-3-pro-image-preview",
     output_dir: str = "./policy_outputs/posters",
 ) -> Callable[[str, str, Any | None], str]:
-    """创建一个基于 Google Gemini 文生图服务的 image_generator。
-
-    返回的函数签名为 (dimension_key, prompt) -> image_path
-    """
+    """创建一个基于 Google Gemini 文生图服务的 image_generator。"""
     client = genai.Client(
         api_key=os.getenv("GEMINI_API_KEY"),
         http_options=types.HttpOptions(
@@ -307,6 +437,29 @@ def make_gemini_image_generator(
         ),
     )
     os.makedirs(output_dir, exist_ok=True)
+
+    def _make_generate_config_disable_afc() -> Any | None:
+        try:
+            gen_cfg_type = getattr(types, "GenerateContentConfig", None)
+            afc_cfg_type = getattr(types, "AutomaticFunctionCallingConfig", None)
+            if gen_cfg_type is None or afc_cfg_type is None:
+                return None
+            afc_cfg = None
+            try:
+                afc_cfg = afc_cfg_type(disable=True)
+            except Exception:
+                try:
+                    afc_cfg = afc_cfg_type(enabled=False)
+                except Exception:
+                    return None
+            try:
+                return gen_cfg_type(automatic_function_calling=afc_cfg)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    _gen_config = _make_generate_config_disable_afc()
 
     def _guess_mime_type(path: str) -> str:
         ext = os.path.splitext(path)[1].lower()
@@ -372,20 +525,21 @@ def make_gemini_image_generator(
                             parts=image_parts + [types.Part(text=prompt)],
                         )
                     ],
+                    config=_gen_config,
                 )
             else:
                 response = client.models.generate_content(
                     model=model,
                     contents=[prompt],
+                    config=_gen_config,
                 )
         except Exception:
             return ""
-        # print(f"[poster_pipeline] Gemini 生成图片完成，响应: {response}")
+
         image_path: str = ""
         image_index = 0
-
         parts_list: List[Any] = []
-    
+
         candidates = getattr(response, "candidates", None)
         if candidates is not None:
             for cand in candidates or []:
@@ -399,7 +553,6 @@ def make_gemini_image_generator(
             inline_data = getattr(part, "inline_data", None)
             if inline_data is None:
                 continue
-
             try:
                 image = part.as_image()
                 filename = f"{int(time.time())}_{dim_key}_{image_index}.png"
@@ -421,12 +574,15 @@ def generate_cover_and_tail_from_single_image(
     output_dir: str = "./policy_outputs/posters",
     logo_path: str = "./assets/logo.png",
     image_input: Any | None = None,
-    max_verify_attempts: int = 2,
+    style_reference: Any | None = None,
+    max_verify_attempts: int = 5,
 ) -> tuple[str, str]:
     """通过一次 Gemini 文生图生成上下两栏图片，并在尾页区域融合指定 logo。
 
-    生成完成后，会调用多模态大模型检查封面和尾页中的文字是否为正常的简体中文，
-    若检测到明显异常（如乱码、主要为外文等），则会在阈值内重试生成。
+    Parameters
+    ----------
+    style_reference : 已生成的维度海报图片（路径、PIL Image 或列表），用于确保封面
+                      和尾页与各维度海报在整体风格上保持一致。
     """
 
     api_key = os.getenv("GEMINI_API_KEY")
@@ -439,7 +595,6 @@ def generate_cover_and_tail_from_single_image(
         output_dir=output_dir,
     )
 
-    # 初始化文字校验器；如果失败，则跳过文字检查但仍然生成一次
     try:
         text_verifier = make_cover_tail_text_verifier()
     except Exception as e:  # noqa: BLE001
@@ -454,28 +609,34 @@ def generate_cover_and_tail_from_single_image(
         "- 要求：标题醒目，一句话总结清晰可读，只包含**一句话总结**的内容，不要包含任何如“摘要：”“一句话总结：”等前缀或说明性文字，也不要添加与政策内容无关的机构名称、logo、公章、二维码、联系电话或“设计：XXX”等署名信息。封面的整体配色、插画风格和版式布局应与之前已经生成的各维度政策海报保持同一套风格（如相近的主色调、简洁的卡片式内容区和扁平插画风格），不要使用完全不同的模板或过于花哨的背景。\n\n"
         "[下半部分：尾页]\n"
         "- 作为本次政策解读的结束页，可以包含简短致谢或提示文案，但这些文字必须与本政策的阅读或使用直接相关，整体配色和版式需要与封面及各维度海报保持一致，好像同一套模板的最后一页。\n"
+        "- 尾页需要在底部或角落等合适位置添加一行署名文字：国机灵通·农业产业大模型生成。要求该行文字清晰可读、字号适中、与整体风格一致，不要喧宾夺主。\n"
         "- 请将我提供的 logo 图像融入尾页的版式中，例如放置在底部与海报主色调一致的色块/条带或圆角区域中，注意保持 logo 比例和清晰度，不要随意修改其形状；尾页中只允许出现这一处 logo，不得额外添加其他机构 logo、公章、二维码或“设计：XXX”等署名信息。避免让 logo 单独悬浮在与整体风格不协调的背景上。\n"
         "- 整张图片中禁止出现作者姓名、设计团队名称、联系方式、网站地址等与政策内容无关的装饰性文字。\n"
         "- 尾页同样不要出现本提示中的方括号标签或说明性文字，只需使用简洁的中文文案和提供的 logo。\n\n"
         "整张图片为竖版，高度大于宽度，上下两个区域边界清晰，方便后续按照高度中线将图片裁剪为两张独立海报。"
     )
 
-    # 默认使用统一背景 + logo 作为视觉输入（如果调用方未显式传入 image_input）
+    # ── 合并图片输入：外部 image_input / 背景 / logo / 风格参照 ──
     if image_input is None:
         inputs: list[Any] = []
-        # 背景图：用于保证封面与尾页与各维度海报背景风格一致
         if BACKGROUND_IMAGE_PATH and os.path.exists(BACKGROUND_IMAGE_PATH):
             inputs.append(BACKGROUND_IMAGE_PATH)
-        # logo：仅用于尾页中的品牌展示
         if logo_path and os.path.exists(logo_path):
             inputs.append(logo_path)
         image_input = inputs or None
+
+    # 将风格参照图合并进去
+    combined_input = _merge_image_inputs(image_input, style_reference)
+
+    # 如果有风格参照，追加风格一致性要求到 prompt
+    if style_reference is not None:
+        prompt = prompt + _STYLE_CONSISTENCY_INSTRUCTION
 
     attempts = 0
     while attempts < max_verify_attempts:
         attempts += 1
         print(f"[poster_pipeline] 第 {attempts} 次调用 Gemini 生成封面+尾页...")
-        big_path = image_generator("cover_tail", prompt, image_input)
+        big_path = image_generator("cover_tail", prompt, combined_input)
         if not big_path:
             print("[poster_pipeline] Gemini 生成封面+尾页失败: 未返回图片")
             continue
@@ -490,8 +651,12 @@ def generate_cover_and_tail_from_single_image(
         width, height = img.size
         mid = height // 2
 
-        cover_img = img.crop((0, 0, width, mid))
-        tail_img = img.crop((0, mid, width, height))
+        overlap = max(0, min(24, height // 20))
+        cover_bottom = min(height, mid + overlap)
+        tail_top = max(0, mid - overlap)
+
+        cover_img = img.crop((0, 0, width, cover_bottom))
+        tail_img = img.crop((0, tail_top, width, height))
 
         os.makedirs(output_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(big_path))[0]
@@ -504,7 +669,6 @@ def generate_cover_and_tail_from_single_image(
         print(f"[poster_pipeline] 封面海报裁剪完成: {cover_path}")
         print(f"[poster_pipeline] 尾页海报裁剪完成: {tail_path}")
 
-        # 如未成功创建文字校验器，则不做检查，直接返回首次生成结果
         if text_verifier is None:
             return cover_path, tail_path
 
@@ -530,10 +694,7 @@ def generate_cover_and_tail_from_single_image(
 def make_doubao_image_verifier(
     model: str = "doubao-seed-1-6-flash-250828",
 ) -> Callable[[str, str, str], bool]:
-    """创建一个独立初始化 doubao 客户端的多模态校验函数工厂。
-
-    返回函数签名为 (dimension_key, short_text, image_path) -> bool。
-    """
+    """创建一个独立初始化 doubao 客户端的多模态校验函数工厂。"""
 
     api_key = os.getenv("ARK_API_KEY")
     if not api_key:
@@ -545,10 +706,11 @@ def make_doubao_image_verifier(
     )
 
     def _encode_image_to_base64(path: str) -> str:
-        img = Image.open(path).convert("RGB")
-        buf = BytesIO()
-        img.save(buf, format="JPEG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
+        with Image.open(path) as opened:
+            img = opened.convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
 
     def _verify(dim_key: str, short_text: str, image_path: str) -> bool:
         try:
@@ -609,12 +771,7 @@ def make_doubao_image_verifier(
 def make_cover_tail_text_verifier(
     model: str = "doubao-seed-1-6-flash-250828",
 ) -> Callable[[str], bool]:
-    """创建一个用于封面/尾页文字检查的多模态校验器。
-
-    返回函数签名为 (image_path) -> bool：
-    - True 表示图片中文字以正常简体中文为主，无明显乱码或大段外文；
-    - False 表示存在异常，需要重新生成。
-    """
+    """创建一个用于封面/尾页文字检查的多模态校验器。"""
 
     api_key = os.getenv("ARK_API_KEY")
     if not api_key:
@@ -626,10 +783,11 @@ def make_cover_tail_text_verifier(
     )
 
     def _encode_image_to_base64(path: str) -> str:
-        img = Image.open(path).convert("RGB")
-        buf = BytesIO()
-        img.save(buf, format="JPEG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
+        with Image.open(path) as opened:
+            img = opened.convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
 
     def _verify(image_path: str) -> bool:
         try:
@@ -638,16 +796,18 @@ def make_cover_tail_text_verifier(
             return False
 
         prompt = (
-            "你是一名负责排查海报中文字质量的审核助手。下面是一张政策宣传海报图片。\n\n"
-            "请仔细识别图片中的所有文字，判断是否存在以下异常：\n"
-            "- 大量乱码、无意义的字符组合；\n"
-            "- 主要内容为非简体中文（如大段英文、其他语言或繁体字占主导）；\n"
-            "- 明显不符合正式中文公文/宣传海报常见的用词和排版习惯；\n"
-            "- 出现明显的模板/占位/页面标签类无关文字，例如英文或拼音形式的“cover”“end page”“page”“slide”“template”等，或含义类似的页码/版式说明。\n\n"
+            "你是一名负责排查海报中文字质量的审核助手。下面是一张图片（封面或尾页）和一段规则，请你只判断图片中的文字是否满足规则。\n\n"
+            "规则：\n"
+            "- 图片中的文字应该以正常的简体中文为主，能够被人类清晰阅读。\n"
+            "- 不应出现以下情况：\n"
+            "  - 大量乱码、无意义的字符组合；\n"
+            "  - 主要内容为非简体中文（如大段英文、其他语言或繁体字占主导）；\n"
+            "  - 明显不符合正式中文公文/宣传海报常见的用词和排版习惯；\n"
+            "  - 出现明显的模板/占位/页面标签类无关文字，例如英文或拼音形式的“cover”“end page”“page”“slide”“template”等，或含义类似的页码/版式说明。\n\n"
             "允许少量常见数字和标点，以及极少量与政策内容直接相关的英文缩写（如 AI、PDF 等），但整体应当以可读的简体中文句子为主，\n"
             "且不应出现任何与本次政策解读无直接关系的模板占位词、页面标签或装饰性说明文字。\n\n"
             "如果整体文字清晰可读、以简体中文为主、没有明显乱码或大段外文，也不存在上述任何模板/占位/页面标签类无关文字，请只输出：通过\n"
-            "只要你认为文字存在上述任何一种异常，请只输出：不通过\n"
+            "否则请只输出：不通过\n"
             "不要输出任何其他内容。"
         )
 
@@ -690,13 +850,7 @@ def concat_poster_images(
     cover_image: str | None = None,
     tail_image: str | None = None,
 ) -> str:
-    """将各维度生成的海报按维度顺序纵向拼接成一张长图并保存。
-
-    - posters: build_poster_records_from_answers 的返回结果
-    - output_path: 拼接后长图的保存路径
-    """
-
-    # 按封面 -> 各维度 -> 尾页的顺序取出对应的图片路径
+    logger.info("[poster_pipeline] Concatenating posters into long image: %s", output_path)
     image_paths: List[str] = []
 
     if cover_image and isinstance(cover_image, str) and cover_image:
@@ -717,7 +871,6 @@ def concat_poster_images(
 
     print(f"[poster_pipeline] 开始拼接长图，本次共 {len(image_paths)} 张图片参与拼接...")
 
-    # 先加载所有图片
     images: List[Image.Image] = []
     for p in image_paths:
         try:
@@ -731,8 +884,6 @@ def concat_poster_images(
         print("[poster_pipeline] 所有图片均无法打开，长图拼接失败。")
         return ""
 
-    # 统一宽度：为了避免插值放大导致模糊，取所有图片宽度中的最小值作为目标宽度，
-    # 将其他图片按比例等比缩放到该宽度，再进行纵向拼接。
     original_widths = [img.width for img in images]
     target_width = min(original_widths)
 
@@ -747,7 +898,6 @@ def concat_poster_images(
         resized_images.append(resized)
         total_height += resized.height
 
-    # 以白色背景创建长图画布
     long_img = Image.new("RGB", (target_width, total_height), color="white")
 
     y_offset = 0
@@ -757,7 +907,15 @@ def concat_poster_images(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     long_img.save(output_path)
+    try:
+        long_img.close()
+    except Exception:
+        pass
+
+    for img in images:
+        try:
+            img.close()
+        except Exception:
+            pass
     print(f"[poster_pipeline] 长图拼接完成，已保存至: {output_path}")
     return output_path
-
-
