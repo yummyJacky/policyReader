@@ -4,6 +4,7 @@ import hashlib
 import uuid
 from pathlib import Path
 import time
+import threading
 from typing import Any, Dict, Iterator, List, Optional
 import concurrent.futures
 
@@ -29,6 +30,10 @@ load_dotenv()
 setup_realtime_logging(log_path="./uvicorn.log")
 logger = get_logger("policy_interpret_api")
 
+# ────────────────────── 模块级线程池 ──────────────────────
+# 海报生成线程池：各维度海报并行生成，不阻塞主线程的检索流程
+_POSTER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+# 长图拼接线程池（封面+尾页+拼接）
 _LONG_POSTER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 
@@ -161,12 +166,13 @@ def _build_policy_pipeline() -> PolicyRetrievalPipeline:
 
 
 def _json_line(payload: Any) -> bytes:
-    # SSE 格式要求以 data: 开头，并以两个换行符结尾
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
 
 def _sse_ping() -> bytes:
     return b"data: ping\n\n"
-    
+
+
 def _text_chunks(text: str, *, chunk_size: int = 200) -> List[str]:
     if not text:
         return []
@@ -199,27 +205,95 @@ def _make_public_file_url(request: Request, local_path: str) -> str:
     return f"{base}{public_prefix}/{rel}"
 
 
+# ────────────────────── 海报任务工厂 ──────────────────────
+
+def _make_poster_task(
+    dk: str,
+    dr: dict,
+    is_first: bool,
+    first_ready_event: threading.Event,
+    style_ref_holder: List[Optional[str]],
+):
+    """创建一个海报生成闭包，在后台线程中执行。
+
+    - 第一个维度的任务直接开始生成（无风格参照）；
+    - 后续维度的任务会等待第一个维度完成，然后使用其图片作为风格参照。
+    - 通过 threading.Event 协调，等待只发生在后台线程中，不阻塞主线程。
+    """
+
+    def task():
+        style_ref = None
+        if not is_first:
+            # 在后台线程中等待第一张海报完成（不阻塞主线程的检索）
+            first_ready_event.wait(timeout=180)
+            style_ref = style_ref_holder[0]
+
+        result = None
+        try:
+            logger.info("Poster task started for dim: %s (is_first=%s, style_ref=%s)", dk, is_first, bool(style_ref))
+            result = build_poster_for_dimension(dk, dr, style_reference=style_ref)
+            logger.info("Poster task finished for dim: %s, has_image=%s", dk, bool(result and result.get("image_result")))
+        finally:
+            # 无论成功还是失败，第一个维度必须通知后续任务，避免永久阻塞
+            if is_first:
+                if result and result.get("image_result"):
+                    style_ref_holder[0] = str(result["image_result"])
+                first_ready_event.set()
+
+        return dk, result
+
+    return task
+
+
+def _collect_poster_futures(
+    poster_futures: Dict[str, "concurrent.futures.Future"],
+    posters_generated: Dict[str, Dict[str, Any]],
+    ping_fn,
+):
+    """从 futures 中收集已完成的海报结果，同时发送 SSE keepalive ping。
+
+    这是一个生成器，会 yield ping 字节。
+    """
+    pending = set(poster_futures.values())
+    # 建立 future -> dim_key 的反向映射
+    future_to_dk = {v: k for k, v in poster_futures.items()}
+
+    while pending:
+        done, pending = concurrent.futures.wait(
+            pending,
+            timeout=2.0,
+            return_when=concurrent.futures.FIRST_COMPLETED,
+        )
+        for f in done:
+            dk = future_to_dk.get(f, "?")
+            try:
+                _, poster_info = f.result()
+                if poster_info and poster_info.get("image_result"):
+                    posters_generated[dk] = poster_info
+                    logger.info("Poster collected for dim: %s", dk)
+            except Exception:
+                logger.exception("Async poster generation failed for dim: %s", dk)
+        if pending:
+            yield ping_fn()
+
+
 @router.post("/api/policy-interpre")
 async def policy_interpret(
     request: Request,
     message: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
 ) -> StreamingResponse:
-    # 强制手动解析逻辑，因为 FastAPI 在混合 Form/File 时对 JSON 的自动支持很弱
     content_type = request.headers.get("content-type", "").lower()
-    
+
     if "application/json" in content_type:
         try:
             body = await request.json()
             if isinstance(body, dict):
-                # 尝试从各种可能的字段名中获取 message
                 message = body.get("message") or body.get("prompt") or body.get("query") or body.get("text")
                 if not message and "data" in body and isinstance(body["data"], dict):
                     message = body["data"].get("message")
         except Exception:
             logger.error("Failed to parse JSON body")
-    
-    # 如果是 Form 数据，FastAPI 已经将 message 注入到变量中了，无需额外操作
 
     if message is None:
         logger.info(
@@ -266,95 +340,77 @@ async def policy_interpret(
 
             partial: Dict[str, Dict[str, str]] = session_state.get("dim_answers") or {}
             posters_generated: Dict[str, Dict[str, Any]] = {}
-            first_style_ref: str | None = None
-            first_dim_key: str | None = None
-            try:
-                first_dim_key = next(iter(POLICY_QUESTIONS.keys()))
-            except Exception:
-                first_dim_key = None
 
             if not from_cache:
+                # ───────── 新文件：检索 + 并行海报生成 ─────────
                 logger.info("Starting new policy interpretation for session %s", session_id)
                 pipeline = _build_policy_pipeline()
                 pipeline.add_inputs(inputs or [])
                 pipeline._ensure_visdom()  # type: ignore[attr-defined]
                 vis_pipeline = pipeline._visdom  # type: ignore[attr-defined]
 
-                poster_futures = []
-                # 使用线程池异步生成海报
-                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-                    for dim_key, question in POLICY_QUESTIONS.items():
-                        try:
-                            resp = vis_pipeline.answer_question(question)
-                            if resp is None:
-                                dim_res = {"question": question, "answer": "", "analysis": ""}
-                            else:
-                                dim_res = {
-                                    "question": question,
-                                    "answer": resp.get("answer", ""),
-                                    "analysis": resp.get("analysis", ""),
-                                }
-                            partial[dim_key] = dim_res
+                # 海报任务协调：第一张完成后通知后续任务获取风格参照
+                poster_futures: Dict[str, concurrent.futures.Future] = {}
+                first_poster_ready = threading.Event()
+                first_style_ref: List[Optional[str]] = [None]
+                is_first_poster = True
 
-                            if intent in ["text_only", "text_and_poster"]:
-                                # 仅流式输出答案内容
-                                for chunk in _text_chunks(dim_res.get("answer", "")):
-                                    yield _json_line({"content": chunk})
-
-                            # 立即提交海报生成任务
-                            if intent in ["text_and_poster", "poster_only"]:
-                                logger.info("Submitting async poster task for dim: %s", dim_key)
-                                def _gen_poster(dk, dr):
-                                    logger.info("Starting poster generation for dim: %s", dk)
-                                    res = build_poster_for_dimension(dk, dr, style_reference=first_style_ref)
-                                    logger.info("Finished poster generation for dim: %s", dk)
-                                    return dk, res
-
-                                if first_dim_key and dim_key == first_dim_key and first_style_ref is None:
-                                    try:
-                                        dk0, poster0 = _gen_poster(dim_key, dim_res)
-                                        if poster0 and poster0.get("image_result"):
-                                            posters_generated[dk0] = poster0
-                                            first_style_ref = str(poster0.get("image_result"))
-                                    except Exception:
-                                        logger.exception("First-dimension poster generation failed")
-                                else:
-                                    poster_futures.append(pool.submit(_gen_poster, dim_key, dim_res))
-
-                            # 检查是否有已完成的任务，及时回收结果
-                            done_futures = [f for f in poster_futures if f.done()]
-                            for f in done_futures:
-                                try:
-                                    dk, poster_info = f.result()
-                                    if poster_info and poster_info.get("image_result"):
-                                        posters_generated[dk] = poster_info
-                                except Exception:
-                                    logger.exception("Async poster generation failed (in loop)")
-                                poster_futures.remove(f)
-
-                        except Exception as exc:  # noqa: BLE001
-                            partial[dim_key] = {
+                # ── 逐维度检索，每个维度完成后立即提交海报任务 ──
+                for dim_key, question in POLICY_QUESTIONS.items():
+                    try:
+                        resp = vis_pipeline.answer_question(question)
+                        if resp is None:
+                            dim_res = {"question": question, "answer": "", "analysis": ""}
+                        else:
+                            dim_res = {
                                 "question": question,
-                                "answer": "",
-                                "analysis": f"调用出错: {exc}",
+                                "answer": resp.get("answer", ""),
+                                "analysis": resp.get("analysis", ""),
                             }
+                        partial[dim_key] = dim_res
 
-                            if intent in ["text_only", "text_and_poster"]:
-                                yield _json_line({"content": f"调用出错: {exc}"})
-                            logger.exception("dim=%s question=%s answer_question failed", dim_key, question)
+                        # 流式输出文本
+                        if intent in ["text_only", "text_and_poster"]:
+                            for chunk in _text_chunks(dim_res.get("answer", "")):
+                                yield _json_line({"content": chunk})
 
-                    # 等待所有异步海报任务完成
-                    for future in concurrent.futures.as_completed(poster_futures):
-                        try:
-                            dk, poster_info = future.result()
-                            if poster_info and poster_info.get("image_result"):
-                                posters_generated[dk] = poster_info
-                        except Exception:
-                            logger.exception("Async poster generation failed")
+                        # 立即提交海报生成任务（非阻塞），同时主线程继续下一个维度的检索
+                        if intent in ["text_and_poster", "poster_only"]:
+                            _is_first = is_first_poster
+                            is_first_poster = False
 
+                            poster_task = _make_poster_task(
+                                dk=dim_key,
+                                dr=dict(dim_res),  # 浅拷贝，防止后续修改
+                                is_first=_is_first,
+                                first_ready_event=first_poster_ready,
+                                style_ref_holder=first_style_ref,
+                            )
+                            future = _POSTER_EXECUTOR.submit(poster_task)
+                            poster_futures[dim_key] = future
+                            logger.info(
+                                "Submitted poster task for dim: %s (is_first=%s), "
+                                "continuing to next retrieval immediately",
+                                dim_key, _is_first,
+                            )
+
+                    except Exception as exc:  # noqa: BLE001
+                        partial[dim_key] = {
+                            "question": question,
+                            "answer": "",
+                            "analysis": f"调用出错: {exc}",
+                        }
+                        if intent in ["text_only", "text_and_poster"]:
+                            yield _json_line({"content": f"调用出错: {exc}"})
+                        logger.exception("dim=%s answer_question failed", dim_key)
+
+                # ── 生成摘要（快速文本操作，不阻塞海报线程） ──
                 try:
                     partial["summary"] = generate_one_sentence_summary(vis_pipeline, partial)
-                    logger.info("Interpretation finished and cached for session %s. Partial keys: %s", session_id, list(partial.keys()))
+                    logger.info(
+                        "Interpretation finished for session %s. Partial keys: %s",
+                        session_id, list(partial.keys()),
+                    )
                 except Exception as exc:  # noqa: BLE001
                     partial["summary"] = {
                         "question": "",
@@ -368,9 +424,27 @@ async def policy_interpret(
                 session_state["dim_summary"] = dim_summary
                 logger.info("Session %s state updated and summary built.", session_id)
 
+                # ── 收集所有海报任务结果（发送 keepalive ping 防超时） ──
+                if poster_futures:
+                    logger.info(
+                        "All retrievals done. Waiting for %d poster tasks to complete...",
+                        len(poster_futures),
+                    )
+                    for ping in _collect_poster_futures(
+                        poster_futures, posters_generated, _sse_ping
+                    ):
+                        yield ping
+
+                    logger.info(
+                        "All poster tasks collected. %d posters generated successfully.",
+                        len(posters_generated),
+                    )
+
             else:
+                # ───────── 缓存模式 ─────────
                 logger.info("Using cached interpretation for session %s", session_id)
-                # 直接把缓存的维度答案逐条推给前端
+
+                # 流式输出缓存的文本
                 if intent in ["text_only", "text_and_poster"]:
                     for dim_key, dim_res in partial.items():
                         if dim_key == "summary":
@@ -379,20 +453,37 @@ async def policy_interpret(
                         for chunk in _text_chunks(a):
                             yield _json_line({"content": chunk})
 
+                # 并行生成海报（与新文件模式相同的并行策略）
                 if intent in ["text_and_poster", "poster_only"]:
-                    # 缓存模式下：后端生成但不实时推送单张图片
                     logger.info("Regenerating posters from cache for session %s", session_id)
-                    for dim_key in POLICY_QUESTIONS.keys():
-                        try:
-                            logger.info("Regenerating poster for dim: %s", dim_key)
-                            poster_info = build_poster_for_dimension(dim_key, partial.get(dim_key) or {})
-                            if poster_info and poster_info.get("image_result"):
-                                posters_generated[dim_key] = poster_info
-                        except Exception as e:
-                            logger.exception("dim=%s build_poster_for_dimension failed (cache mode)", dim_key, exc_info=True)
-                            continue
 
-            # 生成可下载的长图：封面 + 各维度 + 尾页
+                    poster_futures_cache: Dict[str, concurrent.futures.Future] = {}
+                    first_ready_cache = threading.Event()
+                    style_ref_cache: List[Optional[str]] = [None]
+                    is_first_cache = True
+
+                    for dim_key in POLICY_QUESTIONS.keys():
+                        dr = partial.get(dim_key) or {}
+                        _is_first = is_first_cache
+                        is_first_cache = False
+
+                        poster_task = _make_poster_task(
+                            dk=dim_key,
+                            dr=dict(dr),
+                            is_first=_is_first,
+                            first_ready_event=first_ready_cache,
+                            style_ref_holder=style_ref_cache,
+                        )
+                        future = _POSTER_EXECUTOR.submit(poster_task)
+                        poster_futures_cache[dim_key] = future
+
+                    # 收集结果
+                    for ping in _collect_poster_futures(
+                        poster_futures_cache, posters_generated, _sse_ping
+                    ):
+                        yield ping
+
+            # ───────── 生成长图：封面 + 各维度 + 尾页 ─────────
             if intent in ["text_and_poster", "poster_only"] and posters_generated:
                 try:
                     logger.info("Starting long poster concatenation...")
@@ -409,11 +500,20 @@ async def policy_interpret(
                     except Exception:
                         summary_text = ""
 
+                    # 取第一张成功的海报作为封面/尾页的风格参照
+                    cover_style_ref: str | None = None
+                    for dk in POLICY_QUESTIONS.keys():
+                        info = posters_generated.get(dk)
+                        if info and info.get("image_result"):
+                            cover_style_ref = str(info["image_result"])
+                            break
+
                     def _build_long_poster() -> str | None:
                         cover_path, tail_path = generate_cover_and_tail_from_single_image(
                             title=title,
                             summary=summary_text,
                             output_dir="./policy_outputs/posters",
+                            style_reference=cover_style_ref,
                         )
                         logger.info("Cover and tail generated: %s, %s", cover_path, tail_path)
 
@@ -490,4 +590,3 @@ async def policy_interpret(
 
 
 app.include_router(router)
-
